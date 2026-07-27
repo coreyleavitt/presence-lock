@@ -6,6 +6,15 @@ $ErrorActionPreference = 'Stop'
 
 $image = 'mcr.microsoft.com/dotnet/sdk:10.0-windowsservercore-ltsc2022'
 
+docker run --rm --isolation=hyperv `
+    -v "${PSScriptRoot}:C:\src" `
+    -v "presencelock-nuget:C:\nuget" `
+    -e NUGET_PACKAGES=C:\nuget `
+    -w C:\src `
+    $image `
+    dotnet test PresenceLock.Core.Tests\PresenceLock.Core.Tests.fsproj -c Release
+if ($LASTEXITCODE) { throw 'dotnet test failed' }
+
 docker run --rm `
     -v "${PSScriptRoot}:C:\src" `
     -v "presencelock-nuget:C:\nuget" `
