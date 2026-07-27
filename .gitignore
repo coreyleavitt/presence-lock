@@ -4,6 +4,7 @@ obj/
 publish/
 out/
 msix-layout/
+TestResults/
 
 # SDK build tools (restored by pack.ps1 from NuGet)
 tools/

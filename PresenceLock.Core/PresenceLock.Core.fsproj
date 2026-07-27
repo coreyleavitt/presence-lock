@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    net10.0, not net10.0-windows: this library is pure decision logic (no clocks, no I/O,
+    no Windows API surface) and must be testable inside the Linux-parity build container.
+    Do not add RuntimeIdentifier(s), SelfContained, or a Windows-flavored TFM here — the
+    win-x64 self-contained publish of PresenceLock.csproj (the WinExe host) resolves this
+    plain net10.0 ProjectReference as-is; RID/TFM settings added "defensively" would
+    undermine the testable-anywhere goal (rfc-core-brain.md, slice 1).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>PresenceLock.Core</RootNamespace>
+    <AssemblyName>PresenceLock.Core</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Library.fs" />
+  </ItemGroup>
+
+</Project>
