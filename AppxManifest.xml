@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap uap5 rescap">
+
+  <Identity Name="PresenceLock"
+            Publisher="CN=PresenceLock Local"
+            Version="1.0.7.0"
+            ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>PresenceLock</DisplayName>
+    <PublisherDisplayName>Corey</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="PresenceLock" Executable="PresenceLock.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="PresenceLock"
+                          Description="Locks the workstation when no face is present at the camera."
+                          BackgroundColor="transparent"
+                          Square150x150Logo="Assets\Square150x150Logo.png"
+                          Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <uap5:Extension Category="windows.startupTask" Executable="PresenceLock.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:StartupTask TaskId="PresenceLockStartup" Enabled="true" DisplayName="PresenceLock" />
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <DeviceCapability Name="webcam" />
+  </Capabilities>
+
+</Package>

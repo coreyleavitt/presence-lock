@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+publish/
+out/
+msix-layout/
+
+# SDK build tools (restored by pack.ps1 from NuGet)
+tools/
+
+# Signing material — private key and password must never be committed
+cert/
+
+# Local scratch
+*.log

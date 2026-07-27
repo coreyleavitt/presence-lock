@@ -1,0 +1,8 @@
+{
+  "AwayThresholdSeconds": 5,
+  "SampleIntervalMs": 500,
+  "GraceSeconds": 10,
+  "InputIdleSeconds": 10,
+  "CameraNameContains": "",
+  "DarkFrameMeanThreshold": 6
+}
