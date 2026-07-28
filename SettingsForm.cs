@@ -69,6 +69,14 @@ sealed class SettingsForm : Form
             SampleIntervalMs = (int)sampleMs.Value,
             DarkFrameMeanThreshold = (double)darkThreshold.Value,
             CameraNameContains = camera.Text.Trim(),
+            // Not dialog-editable in this RFC (rfc-core-brain.md: "SettingsForm.cs is not
+            // extended") — carried forward unchanged so a Settings save can never silently
+            // reset a file-tuned PolicyConfig value back to its built-in default.
+            NoSignalReportAfterMs = current.NoSignalReportAfterMs,
+            ReevaluateAfterMs = current.ReevaluateAfterMs,
+            ReevaluateCooldownMs = current.ReevaluateCooldownMs,
+            RecoveryFailureThreshold = current.RecoveryFailureThreshold,
+            RecoveryCooldownMs = current.RecoveryCooldownMs,
         };
         var buttons = new FlowLayoutPanel
         {

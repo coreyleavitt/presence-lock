@@ -19,4 +19,21 @@
     <None Include="icon.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!--
+    The default SDK glob does not auto-exclude nested project directories that live under
+    this one — without this, PresenceLock.Tests' xunit-only .cs files would be compiled
+    straight into this WinExe (no xunit reference here), and would fail the build.
+  -->
+  <ItemGroup>
+    <Compile Remove="PresenceLock.Tests\**\*.cs" />
+  </ItemGroup>
+
+  <!--
+    Do not add an explicit FSharp.Core PackageReference here — it flows transitively from
+    this ProjectReference (rfc-core-brain.md, slice 1).
+  -->
+  <ItemGroup>
+    <ProjectReference Include="PresenceLock.Core\PresenceLock.Core.fsproj" />
+  </ItemGroup>
+
 </Project>
