@@ -64,13 +64,32 @@ module Policy =
         else
             true
 
+    /// A baseline-event reset shared by `InitSucceeded`, `SessionUnlocked` (unless paused), and
+    /// `Resumed` (unless already resumed): disarm, re-baseline grace/away from `now`, and reset
+    /// the signal-health clock (rfc-core-brain.md, R2-20) — parity with `ResumeSampling()`'s
+    /// `noSignalStreak = 0`. Deliberately leaves `IsPaused`/`IsSessionLocked` untouched; each
+    /// caller sets exactly the flag(s) its own event owns.
+    let private applyBaselineReset (now: MonotonicMs) (state: State) : State =
+        { state with
+            Armed = false
+            GraceBaselineAt = now
+            AwayBaselineAt = now
+            BadSignalSince = None }
+
     /// `step` for `Sample`/`InitSucceeded` — the slice-3 lock decision, plus slice 4's signal
-    /// accounting for `NoFrame`/`DarkFrame` — and the still-unimplemented placeholder cases for
-    /// event kinds owned by later slices (session/pause: slice 5; recovery: slice 6).
+    /// accounting for `NoFrame`/`DarkFrame` — plus slice 5's session/pause re-baselining. The
+    /// still-unimplemented placeholder cases are recovery events, owned by slice 6.
     let step
         (config: PolicyConfig, state: State, now: MonotonicMs, nowWall: WallClockMs, event: Event)
         : StepResult =
         match event with
+        // Defense in depth (rfc-core-brain.md, "Sample events outside the watching window"):
+        // `Sample` is a complete no-op — unchanged `State`, no effects — whenever paused or
+        // session-locked, regardless of observation kind. This must be checked ahead of the
+        // per-observation arms below, not folded into each of them individually, since it
+        // overrides all of them uniformly.
+        | Event.Sample(_, _) when state.IsPaused || state.IsSessionLocked ->
+            { State = state; Action = Action.NoAction }
         | Event.Sample(Observation.FaceSeen, _inputIdleMs) ->
             let updated =
                 { state with
@@ -148,12 +167,45 @@ module Policy =
                     InitFailStreak = 0 }
                 |> withRecomputedStatus (config, now)
             { State = updated; Action = Action.NoAction }
-        | Event.InitFailed _
-        | Event.CaptureFailed
-        | Event.SessionLocked
-        | Event.SessionUnlocked
-        | Event.Paused
+        | Event.SessionLocked ->
+            // Not a baseline event -- only marks the OS fact. Re-delivery while already
+            // session-locked is idempotent (setting an already-true flag changes nothing).
+            // Status priority (Paused outranks SessionLocked) gives "stays Paused" for free
+            // when this arrives mid-pause -- no pause check needed here.
+            let updated = { state with IsSessionLocked = true } |> withRecomputedStatus (config, now)
+            { State = updated; Action = Action.NoAction }
+        | Event.SessionUnlocked ->
+            if state.IsPaused then
+                // Pause-precedence (rfc-core-brain.md truth table): a SessionUnlocked while
+                // paused is a complete no-op, matching Program.cs's `if (paused) return;` guard
+                // in OnSessionSwitch -- it must not re-baseline, arm, or move Status away from
+                // Paused. Only an explicit Resumed clears the pause.
+                { State = state; Action = Action.NoAction }
+            else
+                let updated =
+                    { applyBaselineReset now state with IsSessionLocked = false }
+                    |> withRecomputedStatus (config, now)
+                { State = updated; Action = Action.NoAction }
+        | Event.Paused ->
+            // Not a baseline event -- Armed/away/signal-health survive a pause unchanged, so
+            // Resumed can restore exactly where sampling left off. Re-delivery while already
+            // paused is idempotent.
+            let updated = { state with IsPaused = true } |> withRecomputedStatus (config, now)
+            { State = updated; Action = Action.NoAction }
         | Event.Resumed ->
+            if state.IsPaused then
+                let updated =
+                    { state with IsPaused = false }
+                    |> applyBaselineReset now
+                    |> withRecomputedStatus (config, now)
+                { State = updated; Action = Action.NoAction }
+            else
+                // Session-event idempotency (R1-36): Resumed while already running is a no-op
+                // -- it must not re-baseline (which would incorrectly disarm/reset the away
+                // clock on a stray duplicate SessionSwitch).
+                { State = state; Action = Action.NoAction }
+        | Event.InitFailed _
+        | Event.CaptureFailed ->
             { State = state; Action = Action.NoAction }
 
     /// Computed during `step` and cached in `State` — reflects the world as of the most

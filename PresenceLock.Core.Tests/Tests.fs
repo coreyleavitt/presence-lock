@@ -300,22 +300,260 @@ let ``dim-light while typing must not lock (regression: fail-closed dim-light lo
     Assert.False(everLocked)
 
 [<Fact>]
-let ``step is still an identity placeholder for event kinds slice 3 does not own (session/pause/recovery)`` () =
-    // Sample/InitSucceeded gain real behavior in slice 3 (tested below); the remaining event
-    // kinds stay untouched placeholders until slices 5 (session/pause) and 6 (recovery).
+let ``step is still an identity placeholder for event kinds slices 3/4 do not own (recovery)`` () =
+    // Sample/InitSucceeded gain real behavior in slice 3; session/pause events gain real
+    // behavior in slice 5 (tested below). Only the recovery events (slice 6) remain untouched
+    // placeholders here.
     let state = Policy.start (MonotonicMs 0L, noStamps)
-    let events =
-        [ Event.InitFailed false
-          Event.InitFailed true
-          Event.CaptureFailed
-          Event.SessionLocked
-          Event.SessionUnlocked
-          Event.Paused
-          Event.Resumed ]
+    let events = [ Event.InitFailed false; Event.InitFailed true; Event.CaptureFailed ]
     for event in events do
         let result = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, event)
         Assert.Equal(Action.NoAction, result.Action)
         Assert.Equal(Status.AcquiringCamera, Policy.status result.State)
+
+// --- Slice 5: session/pause re-baselining ------------------------------------------------
+
+[<Fact>]
+let ``SessionLocked transitions status to SessionLocked and suppresses further Sample-driven locking`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    let lockedResult =
+        Policy.step (someConfig, armedResult.State, MonotonicMs 10002L, WallClockMs 0L, Event.SessionLocked)
+    Assert.Equal(Status.SessionLocked, Policy.status lockedResult.State)
+    // A sample that would otherwise satisfy every lock gate must still not re-emit Action.Lock
+    // while session-locked -- see the "Sample no-op while SessionLocked/Paused" defense-in-depth
+    // rule, tested more directly below.
+    let result =
+        Policy.step (
+            someConfig,
+            lockedResult.State,
+            MonotonicMs 20003L,
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.NoAction, result.Action)
+
+[<Fact>]
+let ``SessionUnlocked re-baselines grace/away/signal-health and disarms, resuming sampling`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    let lockedResult =
+        Policy.step (someConfig, armedResult.State, MonotonicMs 10002L, WallClockMs 0L, Event.SessionLocked)
+    let unlockedResult =
+        Policy.step (someConfig, lockedResult.State, MonotonicMs 20003L, WallClockMs 0L, Event.SessionUnlocked)
+    Assert.Equal(Status.Watching, Policy.status unlockedResult.State)
+    let snap = Policy.snapshot (someConfig, unlockedResult.State, MonotonicMs 20003L)
+    Assert.False(snap.Armed)
+    Assert.True(snap.InGrace)
+    Assert.Equal(0L, snap.AwayForMs)
+    Assert.Equal(0L, snap.NoSignalForMs)
+    // Grace after unlock: a NoFace sample immediately after (before GraceMs elapses since the
+    // unlock baseline) must not lock, even though the pre-lock session had long satisfied every
+    // gate.
+    let result =
+        Policy.step (
+            someConfig,
+            unlockedResult.State,
+            MonotonicMs(20003L + someConfig.GraceMs - 1L),
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.NoAction, result.Action)
+
+[<Fact>]
+let ``a Sample event is a complete no-op while SessionLocked: no arming, no re-baseline, no Lock`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let lockedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.SessionLocked)
+    let beforeSnap = Policy.snapshot (someConfig, lockedResult.State, MonotonicMs 50000L)
+    // A FaceSeen while locked must not arm -- if it did, an immediate unlock would incorrectly
+    // start out armed.
+    let sampledResult =
+        Policy.step (
+            someConfig,
+            lockedResult.State,
+            MonotonicMs 50000L,
+            WallClockMs 0L,
+            Event.Sample(Observation.FaceSeen, 20000L)
+        )
+    let afterSnap = Policy.snapshot (someConfig, sampledResult.State, MonotonicMs 50000L)
+    Assert.Equal(Action.NoAction, sampledResult.Action)
+    Assert.Equal(Status.SessionLocked, Policy.status sampledResult.State)
+    Assert.Equal(beforeSnap.Armed, afterSnap.Armed)
+    Assert.Equal(beforeSnap.AwayForMs, afterSnap.AwayForMs)
+    Assert.Equal(beforeSnap.NoSignalForMs, afterSnap.NoSignalForMs)
+
+[<Fact>]
+let ``Paused transitions status to Paused, stops sampling, but does not disarm or touch the away baseline`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    let beforeSnap = Policy.snapshot (someConfig, armedResult.State, MonotonicMs 2L)
+    let pausedResult = Policy.step (someConfig, armedResult.State, MonotonicMs 2L, WallClockMs 0L, Event.Paused)
+    let afterSnap = Policy.snapshot (someConfig, pausedResult.State, MonotonicMs 2L)
+    Assert.Equal(Status.Paused, Policy.status pausedResult.State)
+    // Paused is not a baseline event -- Armed/AwayBaselineAt must survive it unchanged.
+    Assert.Equal(beforeSnap.Armed, afterSnap.Armed)
+    Assert.Equal(beforeSnap.AwayForMs, afterSnap.AwayForMs)
+    // A Sample while Paused must not lock even though away/grace/idle are all already satisfied.
+    let result =
+        Policy.step (
+            someConfig,
+            pausedResult.State,
+            MonotonicMs 20003L,
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.NoAction, result.Action)
+
+[<Fact>]
+let ``Resumed re-baselines grace/away/signal-health and disarms, resuming sampling`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    let pausedResult = Policy.step (someConfig, armedResult.State, MonotonicMs 2L, WallClockMs 0L, Event.Paused)
+    let resumedResult = Policy.step (someConfig, pausedResult.State, MonotonicMs 10003L, WallClockMs 0L, Event.Resumed)
+    Assert.Equal(Status.Watching, Policy.status resumedResult.State)
+    let snap = Policy.snapshot (someConfig, resumedResult.State, MonotonicMs 10003L)
+    Assert.False(snap.Armed)
+    Assert.True(snap.InGrace)
+    Assert.Equal(0L, snap.AwayForMs)
+    Assert.Equal(0L, snap.NoSignalForMs)
+    let result =
+        Policy.step (
+            someConfig,
+            resumedResult.State,
+            MonotonicMs(10003L + someConfig.GraceMs - 1L),
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.NoAction, result.Action)
+
+[<Fact>]
+let ``pause takes precedence over an unlock-driven resume: SessionUnlocked while Paused is a no-op`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    let pausedResult = Policy.step (someConfig, armedResult.State, MonotonicMs 2L, WallClockMs 0L, Event.Paused)
+    let beforeSnap = Policy.snapshot (someConfig, pausedResult.State, MonotonicMs 3L)
+    // A stray/racy SessionUnlocked arrives while paused (matching Program.cs's
+    // `if (paused) return;` guard in OnSessionSwitch) -- must not re-baseline, arm, or move
+    // Status away from Paused; only an explicit Resumed clears the pause.
+    let result = Policy.step (someConfig, pausedResult.State, MonotonicMs 3L, WallClockMs 0L, Event.SessionUnlocked)
+    let afterSnap = Policy.snapshot (someConfig, result.State, MonotonicMs 3L)
+    Assert.Equal(Status.Paused, Policy.status result.State)
+    Assert.Equal(beforeSnap.Armed, afterSnap.Armed)
+    Assert.Equal(beforeSnap.AwayForMs, afterSnap.AwayForMs)
+
+[<Fact>]
+let ``session-event idempotency: SessionLocked delivered twice while already locked is a no-op`` () =
+    // Windows is known to double-fire SessionSwitch (rfc-core-brain.md, R1-36).
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let firstLock = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.SessionLocked)
+    let secondLock = Policy.step (someConfig, firstLock.State, MonotonicMs 2L, WallClockMs 0L, Event.SessionLocked)
+    Assert.Equal(Status.SessionLocked, Policy.status secondLock.State)
+
+[<Fact>]
+let ``session-event idempotency: Paused delivered twice while already paused is a no-op`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    let firstPause = Policy.step (someConfig, armedResult.State, MonotonicMs 2L, WallClockMs 0L, Event.Paused)
+    let secondPause = Policy.step (someConfig, firstPause.State, MonotonicMs 3L, WallClockMs 0L, Event.Paused)
+    Assert.Equal(Status.Paused, Policy.status secondPause.State)
+
+[<Fact>]
+let ``session-event idempotency: Resumed while already running (not paused) is a no-op`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    // Not paused -- a stray/duplicate Resumed (Windows double-firing SessionSwitch) must not
+    // re-baseline (which would incorrectly disarm and reset the away clock).
+    let beforeSnap = Policy.snapshot (someConfig, armedResult.State, MonotonicMs 2L)
+    let result = Policy.step (someConfig, armedResult.State, MonotonicMs 2L, WallClockMs 0L, Event.Resumed)
+    let afterSnap = Policy.snapshot (someConfig, result.State, MonotonicMs 2L)
+    Assert.Equal(beforeSnap.Armed, afterSnap.Armed)
+    Assert.Equal(beforeSnap.AwayForMs, afterSnap.AwayForMs)
+    Assert.Equal(Status.Watching, Policy.status result.State)
+
+[<Fact>]
+let ``config changed mid-grace applies immediately, without discarding accumulated baseline state`` () =
+    let tighterConfig = { someConfig with GraceMs = 2000L }
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    // Under the original config (GraceMs = 10000), t=3000 is still mid-grace and must not lock.
+    let stillOriginal =
+        Policy.step (
+            someConfig,
+            armedResult.State,
+            MonotonicMs 3000L,
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.NoAction, stillOriginal.Action)
+    // The very next sample, under a live-reloaded tighter config (GraceMs = 2000), sees grace
+    // already elapsed (from the same FaceSeen baseline at t=1) and away/idle both satisfied --
+    // it must lock on this sample, without needing to discard/replay any accumulated state.
+    let underTighterConfig =
+        Policy.step (
+            tighterConfig,
+            stillOriginal.State,
+            MonotonicMs 6001L,
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.Lock, underTighterConfig.Action)
+
+[<Fact>]
+let ``an 8-hour tick gap followed by NoFace (idle satisfied) locks on the very next sample`` () =
+    let eightHoursMs = 8L * 60L * 60L * 1000L
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    // The machine sleeps for 8 hours; TickCount64 (and so `now`) jumps by the same amount on
+    // wake, gap-obliviously -- away/grace/idle are all trivially satisfied by an 8-hour gap.
+    let result =
+        Policy.step (
+            someConfig,
+            armedResult.State,
+            MonotonicMs(1L + eightHoursMs),
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.Lock, result.Action)
+
+[<Fact>]
+let ``the same 8-hour tick gap followed by NoFrame does not lock`` () =
+    let eightHoursMs = 8L * 60L * 60L * 1000L
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    // NoFrame never arms and resets the away-baseline (fail-open) -- an 8-hour gap ending in a
+    // NoFrame observation must never lock.
+    let result =
+        Policy.step (
+            someConfig,
+            armedResult.State,
+            MonotonicMs(1L + eightHoursMs),
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFrame, 20000L)
+        )
+    Assert.Equal(Action.NoAction, result.Action)
 
 [<Properties(Arbitrary = [| typeof<Generators> |])>]
 module PropertyTests =
@@ -594,3 +832,48 @@ module PropertyTests =
             fireTimes
             |> List.pairwise
             |> List.forall (fun (a, b) -> b - a >= config.ReevaluateCooldownMs))
+
+    // --- Property 8 (rfc-core-brain.md, slice 5) --------------------------------------------
+
+    /// Independent test-side model of the two flags `Sample`'s no-op gate depends on, updated
+    /// by the same truth table `step` itself implements (rfc-core-brain.md, "Session/pause
+    /// precedence") — never read back from `Policy.status`/`Snapshot`, which would make the
+    /// implementation its own oracle (same discipline as property 1's independent armed model,
+    /// R2-28).
+    let private applyPauseLockModel (isPaused: bool, isSessionLocked: bool) (event: Event) =
+        match event with
+        | Event.SessionLocked -> (isPaused, true)
+        | Event.SessionUnlocked -> if isPaused then (isPaused, isSessionLocked) else (isPaused, false)
+        | Event.Paused -> (true, isSessionLocked)
+        | Event.Resumed -> if isPaused then (false, isSessionLocked) else (isPaused, isSessionLocked)
+        | _ -> (isPaused, isSessionLocked)
+
+    [<Property>]
+    let ``property 8: Sample events while paused or session-locked never change the armed/away/signal-health baseline and never emit Action.Lock``
+        (config: PolicyConfig)
+        (stamps: RestartStamps)
+        (startAt: MonotonicMs)
+        =
+        let (MonotonicMs startMs) = startAt
+        Prop.forAll (Arb.fromGen wallTicksGen) (fun ticks ->
+            let initialState = Policy.start (MonotonicMs startMs, stamps)
+            let folder (state, nowMs, isPaused, isSessionLocked, ok) (deltaMs, event) =
+                let nowMs' = nowMs + deltaMs
+                let beforeSnap = Policy.snapshot (config, state, MonotonicMs nowMs')
+                let result = Policy.step (config, state, MonotonicMs nowMs', WallClockMs 0L, event)
+                let afterSnap = Policy.snapshot (config, result.State, MonotonicMs nowMs')
+                let gated = isPaused || isSessionLocked
+                let ok' =
+                    ok
+                    && (match event with
+                        | Event.Sample _ when gated ->
+                            result.Action = Action.NoAction
+                            && beforeSnap.Armed = afterSnap.Armed
+                            && beforeSnap.AwayForMs = afterSnap.AwayForMs
+                            && beforeSnap.NoSignalForMs = afterSnap.NoSignalForMs
+                        | _ -> true)
+                let isPaused', isSessionLocked' = applyPauseLockModel (isPaused, isSessionLocked) event
+                (result.State, nowMs', isPaused', isSessionLocked', ok')
+            let _, _, _, _, ok =
+                List.fold folder (initialState, startMs, false, false, true) ticks
+            ok)
