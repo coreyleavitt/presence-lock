@@ -25,14 +25,90 @@ module Policy =
           // yet — priority row 4 (Status priority table, rfc-core-brain.md "Notes").
           CachedStatus = Status.AcquiringCamera }
 
-    /// Placeholder for slice 2: no `Event` yet drives a real transition. `step` is total —
-    /// it terminates and returns without throwing for any input — but every case here is an
-    /// identity no-op until slices 3-6 wire in arming, away/grace/idle gating, signal
-    /// accounting, session/pause re-baselining, and recovery policy against these same fields.
+    /// Total, priority-ordered `State -> Status` projection (rfc-core-brain.md, the Status
+    /// priority table in "Notes"). `PolicyConfig`/`now` are needed only for row 5 (`NoSignal`):
+    /// whether the current continuous bad-signal run has crossed `NoSignalReportAfterMs` as of
+    /// this step's `now`. Rows 1-4 are pure `State` predicates. Recomputed on every `step` and
+    /// cached in `State.CachedStatus` — see the module-level doc on `status`.
+    let private computeStatus (config: PolicyConfig, state: State, now: MonotonicMs) : Status =
+        if state.IsPaused then
+            Status.Paused
+        elif state.IsSessionLocked then
+            Status.SessionLocked
+        elif not state.HasSucceededOnce then
+            if state.InitFailStreak >= 1 then Status.Recovering else Status.AcquiringCamera
+        else
+            let (MonotonicMs nowMs) = now
+            let badSignalForMs =
+                match state.BadSignalSince with
+                | None -> 0L
+                | Some (MonotonicMs sinceMs) -> nowMs - sinceMs
+            if badSignalForMs >= config.NoSignalReportAfterMs then
+                Status.NoSignal
+            else
+                Status.Watching
+
+    /// Recomputes and caches `Status` against the state as of this `step`'s `now` — every
+    /// branch below ends with this, since `Status`'s `NoSignal` row (row 5) depends on `now`
+    /// even when no other field changed (slice 4).
+    let private withRecomputedStatus (config: PolicyConfig, now: MonotonicMs) (state: State) : State =
+        { state with CachedStatus = computeStatus (config, state, now) }
+
+    /// `step` for `Sample`/`InitSucceeded` — the slice-3 lock decision — plus the still-
+    /// unimplemented placeholder cases for event kinds owned by later slices (session/pause:
+    /// slice 5; recovery: slice 6). `NoFrame`/`DarkFrame` observations are also left as identity
+    /// no-ops here: their fail-open away-baseline reset and bad-signal streak accounting is
+    /// slice 4's "Signal accounting" material, deliberately not forward-referenced.
     let step
-        (_config: PolicyConfig, state: State, _now: MonotonicMs, _nowWall: WallClockMs, _event: Event)
+        (config: PolicyConfig, state: State, now: MonotonicMs, _nowWall: WallClockMs, event: Event)
         : StepResult =
-        { State = state; Action = Action.NoAction }
+        match event with
+        | Event.Sample(Observation.FaceSeen, _inputIdleMs) ->
+            let updated =
+                { state with
+                    Armed = true
+                    AwayBaselineAt = now
+                    BadSignalSince = None }
+                |> withRecomputedStatus (config, now)
+            { State = updated; Action = Action.NoAction }
+        | Event.Sample(Observation.NoFace, inputIdleMs) ->
+            // A healthy sample (camera working, just no face) resets the signal-health clock
+            // identically to `FaceSeen` — only `NoFrame`/`DarkFrame` are "bad signal" — but,
+            // unlike `FaceSeen`, does not touch `Armed`/`AwayBaselineAt`: that's precisely what
+            // lets the away clock accumulate toward `AwayThresholdMs`.
+            let updated = { state with BadSignalSince = None } |> withRecomputedStatus (config, now)
+            let (MonotonicMs nowMs) = now
+            let (MonotonicMs graceBaselineMs) = updated.GraceBaselineAt
+            let (MonotonicMs awayBaselineMs) = updated.AwayBaselineAt
+            let outOfGrace = nowMs - graceBaselineMs >= config.GraceMs
+            let awaySatisfied = nowMs - awayBaselineMs >= config.AwayThresholdMs
+            let idleSatisfied = inputIdleMs >= config.InputIdleRequiredMs
+            let action =
+                if updated.Armed && outOfGrace && awaySatisfied && idleSatisfied then
+                    Action.Lock
+                else
+                    Action.NoAction
+            { State = updated; Action = action }
+        | Event.InitSucceeded ->
+            let updated =
+                { state with
+                    Armed = false
+                    GraceBaselineAt = now
+                    AwayBaselineAt = now
+                    BadSignalSince = None
+                    HasSucceededOnce = true
+                    InitFailStreak = 0 }
+                |> withRecomputedStatus (config, now)
+            { State = updated; Action = Action.NoAction }
+        | Event.Sample(Observation.NoFrame, _)
+        | Event.Sample(Observation.DarkFrame, _)
+        | Event.InitFailed _
+        | Event.CaptureFailed
+        | Event.SessionLocked
+        | Event.SessionUnlocked
+        | Event.Paused
+        | Event.Resumed ->
+            { State = state; Action = Action.NoAction }
 
     /// Computed during `step` and cached in `State` — reflects the world as of the most
     /// recent event, at most one sample interval stale under normal sampling; the shell reads
