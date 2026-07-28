@@ -300,16 +300,14 @@ let ``dim-light while typing must not lock (regression: fail-closed dim-light lo
     Assert.False(everLocked)
 
 [<Fact>]
-let ``step is still an identity placeholder for event kinds slices 3/4 do not own (recovery)`` () =
-    // Sample/InitSucceeded gain real behavior in slice 3; session/pause events gain real
-    // behavior in slice 5 (tested below). Only the recovery events (slice 6) remain untouched
-    // placeholders here.
+let ``CaptureFailed before any InitSucceeded is a no-op (not a shell-reachable state, but step must stay total)`` () =
+    // The shell only ever raises CaptureFailed for a live capture (MediaCapture.Failed), so
+    // HasSucceededOnce is always true along the real call path -- this exercises the
+    // otherwise-undefined pre-success case defensively rather than silently.
     let state = Policy.start (MonotonicMs 0L, noStamps)
-    let events = [ Event.InitFailed false; Event.InitFailed true; Event.CaptureFailed ]
-    for event in events do
-        let result = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, event)
-        Assert.Equal(Action.NoAction, result.Action)
-        Assert.Equal(Status.AcquiringCamera, Policy.status result.State)
+    let result = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.CaptureFailed)
+    Assert.Equal(Action.NoAction, result.Action)
+    Assert.Equal(Status.AcquiringCamera, Policy.status result.State)
 
 // --- Slice 5: session/pause re-baselining ------------------------------------------------
 
@@ -436,6 +434,17 @@ let ``Resumed re-baselines grace/away/signal-health and disarms, resuming sampli
         )
     Assert.Equal(Action.NoAction, result.Action)
 
+// --- Slice 6: recovery policy (InitFailed / CaptureFailed) -------------------------------
+
+[<Fact>]
+let ``InitFailed transitions status to Recovering on the very first pre-success failure, of either classification, without yet requesting a restart`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let result = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitFailed false)
+    Assert.Equal(Status.Recovering, Policy.status result.State)
+    Assert.Equal(Action.NoAction, result.Action)
+    let snap = Policy.snapshot (someConfig, result.State, MonotonicMs 0L)
+    Assert.Equal(1, snap.InitFailStreak)
+
 [<Fact>]
 let ``pause takes precedence over an unlock-driven resume: SessionUnlocked while Paused is a no-op`` () =
     let state = Policy.start (MonotonicMs 0L, noStamps)
@@ -554,6 +563,127 @@ let ``the same 8-hour tick gap followed by NoFrame does not lock`` () =
             Event.Sample(Observation.NoFrame, 20000L)
         )
     Assert.Equal(Action.NoAction, result.Action)
+
+[<Fact>]
+let ``InitFailed requests Action.Restart CameraWedged once RecoveryFailureThreshold consecutive handle-invalid failures are reached and no cooldown applies`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    // RecoveryFailureThreshold = 3 in someConfig; the first two handle-invalid failures stay
+    // below threshold.
+    let first = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitFailed true)
+    Assert.Equal(Action.NoAction, first.Action)
+    let second = Policy.step (someConfig, first.State, MonotonicMs 1L, WallClockMs 1L, Event.InitFailed true)
+    Assert.Equal(Action.NoAction, second.Action)
+    // Third consecutive handle-invalid failure crosses the threshold; no stamped WedgeAt exists
+    // yet, so cooldownElapsed is vacuously true.
+    let third = Policy.step (someConfig, second.State, MonotonicMs 2L, WallClockMs 2L, Event.InitFailed true)
+    Assert.Equal(Action.Restart RestartReason.CameraWedged, third.Action)
+    let snap = Policy.snapshot (someConfig, third.State, MonotonicMs 2L)
+    Assert.Equal(System.Nullable(2L), snap.LastWedgeRestartAt)
+
+[<Fact>]
+let ``a cooldown-suppressed InitFailed wedge restart stays saturated and fires immediately once the cooldown clears`` () =
+    // A CameraWedged restart happened recently (wall-clock 500) before this process even
+    // started -- randomized initial RestartStamps continuity (R2-19).
+    let stampsRecentWedge: RestartStamps =
+        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable() }
+    let state = Policy.start (MonotonicMs 0L, stampsRecentWedge)
+    let first = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 600L, Event.InitFailed true)
+    let second = Policy.step (someConfig, first.State, MonotonicMs 1L, WallClockMs 700L, Event.InitFailed true)
+    // Threshold (3) crossed here, but only 300ms of wall-clock have elapsed since WedgeAt (500)
+    // -- well under RecoveryCooldownMs (600000) -- so the restart is suppressed.
+    let suppressed = Policy.step (someConfig, second.State, MonotonicMs 2L, WallClockMs 800L, Event.InitFailed true)
+    Assert.Equal(Action.NoAction, suppressed.Action)
+    // Saturated: the streak keeps growing but stays suppressed on the very next failure too.
+    let stillSuppressed =
+        Policy.step (someConfig, suppressed.State, MonotonicMs 3L, WallClockMs 900L, Event.InitFailed true)
+    Assert.Equal(Action.NoAction, stillSuppressed.Action)
+    // Cooldown clears (600000ms wall-clock since WedgeAt = 500) -- fires immediately.
+    let cooldownClearedWall = 500L + someConfig.RecoveryCooldownMs
+    let fired =
+        Policy.step (someConfig, stillSuppressed.State, MonotonicMs 4L, WallClockMs cooldownClearedWall, Event.InitFailed true)
+    Assert.Equal(Action.Restart RestartReason.CameraWedged, fired.Action)
+
+[<Fact>]
+let ``a long run of handleInvalid:false InitFailed events never requests a restart, even once RecoveryFailureThreshold and RecoveryCooldownMs are both long since satisfied (unplugged/absent camera)`` () =
+    // Regression for the unplug/replug analysis (rfc-core-brain.md, "Notes: Camera unplug/
+    // replug, analyzed"): the pre-success streak gate requires handle-invalid failures, so a
+    // camera that is simply absent (never handle-invalid) must retry forever without ever
+    // requesting a process restart -- restarting cannot summon a camera that isn't there.
+    let mutable state = Policy.start (MonotonicMs 0L, noStamps)
+    let mutable everRestarted = false
+    for i in 1 .. 50 do
+        let t = int64 i * 5000L
+        let result = Policy.step (someConfig, state, MonotonicMs t, WallClockMs t, Event.InitFailed false)
+        state <- result.State
+        if result.Action <> Action.NoAction then
+            everRestarted <- true
+    Assert.False(everRestarted)
+    Assert.Equal(Status.Recovering, Policy.status state)
+
+[<Fact>]
+let ``CaptureFailed after InitSucceeded requests Action.Restart CameraWedged unconditionally on its first occurrence, subject only to cooldown`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    // RecoveryFailureThreshold (3) is never approached -- a single CaptureFailed is enough.
+    let result = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 1L, Event.CaptureFailed)
+    Assert.Equal(Action.Restart RestartReason.CameraWedged, result.Action)
+    let snap = Policy.snapshot (someConfig, result.State, MonotonicMs 1L)
+    Assert.Equal(System.Nullable(1L), snap.LastWedgeRestartAt)
+
+[<Fact>]
+let ``CaptureFailed while Paused still requests Action.Restart, and the restart preserves the pause`` () =
+    // Deliberate asymmetry (rfc-core-brain.md, R2-10): sample-driven decisions are pause-immune,
+    // failure-driven restarts are not -- the camera is kept alive while paused, so its death is
+    // a real fact requiring recovery, and R1-30's persisted pause flag exists precisely so such
+    // a restart preserves the pause.
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let pausedResult = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Paused)
+    let result = Policy.step (someConfig, pausedResult.State, MonotonicMs 2L, WallClockMs 1L, Event.CaptureFailed)
+    Assert.Equal(Action.Restart RestartReason.CameraWedged, result.Action)
+    // Status priority (Paused outranks everything) holds even though a restart was requested --
+    // the restart branch never touches IsPaused.
+    Assert.Equal(Status.Paused, Policy.status result.State)
+
+[<Fact>]
+let ``a cooldown-suppressed CaptureFailed returns Action.NoAction (the shell falls back to the NoFrame-to-reevaluation backstop)`` () =
+    let stampsRecentWedge: RestartStamps =
+        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable() }
+    let state = Policy.start (MonotonicMs 0L, stampsRecentWedge)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 500L, Event.InitSucceeded)
+    let result = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 600L, Event.CaptureFailed)
+    Assert.Equal(Action.NoAction, result.Action)
+
+[<Fact>]
+let ``scenario: a cooldown-suppressed CaptureFailed recovers via the NoFrame-to-reevaluation backstop, with no new mechanism`` () =
+    // rfc-core-brain.md, "Notes: recovery boundary" -- the cooldown-suppressed CaptureFailed
+    // backstop (R2-2): core-side, the suppressed path returns NoAction; the shell tears down the
+    // dead capture but keeps the sample timer running, so SampleAsync with a null reader emits
+    // Sample(NoFrame, ...) on every subsequent tick. This scenario reproduces exactly that using
+    // only mechanisms slice 4 already implements -- no new recovery path.
+    let stampsRecentWedge: RestartStamps =
+        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable() }
+    let state = Policy.start (MonotonicMs 0L, stampsRecentWedge)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 500L, Event.InitSucceeded)
+    let suppressed = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 600L, Event.CaptureFailed)
+    Assert.Equal(Action.NoAction, suppressed.Action)
+    // The shell keeps sampling with a null reader -- the very next sample already observes
+    // NoFrame. Once continuous bad signal reaches ReevaluateAfterMs (20000) and
+    // ReevaluateCooldownMs (600000, measured against ReevalAt = null => vacuously clear) permits,
+    // step requests the reevaluation restart -- recovering the dead camera without ever routing
+    // back through CaptureFailed/InitFailed.
+    let firstBad =
+        Policy.step (someConfig, suppressed.State, MonotonicMs 1000L, WallClockMs 1600L, Event.Sample(Observation.NoFrame, 0L))
+    Assert.Equal(Status.Watching, Policy.status firstBad.State)
+    let laterBad =
+        Policy.step (
+            someConfig,
+            firstBad.State,
+            MonotonicMs(1000L + someConfig.ReevaluateAfterMs),
+            WallClockMs(1600L + someConfig.ReevaluateAfterMs),
+            Event.Sample(Observation.NoFrame, 0L)
+        )
+    Assert.Equal(Action.Restart RestartReason.CameraReevaluation, laterBad.Action)
 
 [<Properties(Arbitrary = [| typeof<Generators> |])>]
 module PropertyTests =
@@ -876,4 +1006,67 @@ module PropertyTests =
                 (result.State, nowMs', isPaused', isSessionLocked', ok')
             let _, _, _, _, ok =
                 List.fold folder (initialState, startMs, false, false, true) ticks
+            ok)
+
+    // --- Properties 5, 9 (rfc-core-brain.md, slice 6) ---------------------------------------
+
+    [<Property>]
+    let ``property 5: at most one Action.Restart CameraWedged per RecoveryCooldownMs window``
+        (config: PolicyConfig)
+        (stamps: RestartStamps)
+        (startAt: MonotonicMs)
+        (startWallAt: WallClockMs)
+        =
+        let (MonotonicMs startMs) = startAt
+        let (WallClockMs startWallMs) = startWallAt
+        Prop.forAll (Arb.fromGen wallTicksGen) (fun ticks ->
+            let initialState = Policy.start (MonotonicMs startMs, stamps)
+            let folder (state, nowMs, nowWallMs, fireTimesDesc) (deltaMs, event) =
+                let nowMs' = nowMs + deltaMs
+                let nowWallMs' = nowWallMs + deltaMs
+                let result = Policy.step (config, state, MonotonicMs nowMs', WallClockMs nowWallMs', event)
+                let fireTimesDesc' =
+                    match result.Action with
+                    | Action.Restart RestartReason.CameraWedged -> nowWallMs' :: fireTimesDesc
+                    | _ -> fireTimesDesc
+                (result.State, nowMs', nowWallMs', fireTimesDesc')
+            let _, _, _, fireTimesDesc =
+                List.fold folder (initialState, startMs, startWallMs, []) ticks
+            // Prepend the randomized initial stamp (if any CameraWedged restart ever happened
+            // before this process started) so the property also covers cross-restart cooldown
+            // continuity (R2-19) -- restarts can be requested by either InitFailed (streak-gated)
+            // or CaptureFailed (unconditional), and the cooldown must hold across both sources.
+            let fireTimes =
+                match stamps.WedgeAt with
+                | v when v.HasValue -> v.Value :: List.rev fireTimesDesc
+                | _ -> List.rev fireTimesDesc
+            fireTimes
+            |> List.pairwise
+            |> List.forall (fun (a, b) -> b - a >= config.RecoveryCooldownMs))
+
+    [<Property>]
+    let ``property 9: a Lock-producing Sample re-emits Action.Lock when immediately repeated with no intervening SessionLocked (no internal latch)``
+        (config: PolicyConfig)
+        (stamps: RestartStamps)
+        (startAt: MonotonicMs)
+        =
+        let (MonotonicMs startMs) = startAt
+        Prop.forAll (Arb.fromGen wallTicksGen) (fun ticks ->
+            let initialState = Policy.start (MonotonicMs startMs, stamps)
+            let folder (state, nowMs, ok) (deltaMs, event) =
+                let nowMs' = nowMs + deltaMs
+                let result = Policy.step (config, state, MonotonicMs nowMs', WallClockMs 0L, event)
+                let ok' =
+                    ok
+                    && (if result.Action = Action.Lock then
+                            // Re-derivation, not a latch: step does not remember having emitted
+                            // Lock -- it only learns a lock actually took hold via a subsequent
+                            // Event.SessionLocked, sourced from the real OS notification. Since no
+                            // event intervenes here, the identical Sample must re-emit Action.Lock.
+                            let repeat = Policy.step (config, result.State, MonotonicMs nowMs', WallClockMs 0L, event)
+                            repeat.Action = Action.Lock
+                        else
+                            true)
+                (result.State, nowMs', ok')
+            let _, _, ok = List.fold folder (initialState, startMs, true) ticks
             ok)

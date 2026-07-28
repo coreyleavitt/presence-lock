@@ -64,6 +64,24 @@ module Policy =
         else
             true
 
+    /// Shared wedge-restart decision (rfc-core-brain.md slice-6 refactor note, R2-30): given
+    /// whether the caller already wants to request a `CameraWedged` restart (`InitFailed` gates
+    /// this on streak+classification before calling in; `CaptureFailed` always wants it once
+    /// `HasSucceededOnce`), applies the `RecoveryCooldownMs` gate against `Stamps.WedgeAt` via
+    /// `cooldownElapsed`, and, only if the restart actually fires, stamps `WedgeAt` with this
+    /// step's `nowWall` -- deduplicating the "check cooldown, stamp on fire" idiom the two
+    /// recovery events would otherwise re-derive independently.
+    let private requestWedgeRestart
+        (nowWallMs: int64, cooldownMs: int64, stamps: RestartStamps, wantsRestart: bool)
+        : RestartStamps * bool =
+        let restartDue = wantsRestart && cooldownElapsed (nowWallMs, cooldownMs, stamps.WedgeAt)
+        let stamps' =
+            if restartDue then
+                { stamps with WedgeAt = System.Nullable(nowWallMs) }
+            else
+                stamps
+        (stamps', restartDue)
+
     /// A baseline-event reset shared by `InitSucceeded`, `SessionUnlocked` (unless paused), and
     /// `Resumed` (unless already resumed): disarm, re-baseline grace/away from `now`, and reset
     /// the signal-health clock (rfc-core-brain.md, R2-20) — parity with `ResumeSampling()`'s
@@ -204,9 +222,51 @@ module Policy =
                 // -- it must not re-baseline (which would incorrectly disarm/reset the away
                 // clock on a stray duplicate SessionSwitch).
                 { State = state; Action = Action.NoAction }
-        | Event.InitFailed _
+        | Event.InitFailed handleInvalid ->
+            // Pre-success only in practice (rfc-core-brain.md, "Notes: recovery boundary").
+            // InitFailStreak counts every consecutive pre-success InitFailed regardless of
+            // classification -- the Status priority table's row 3 reads "no InitSucceeded yet;
+            // >=1 InitFailed seen," not ">=1 handle-invalid InitFailed seen," so Status.Recovering
+            // engages on the very first failure of either kind (this is what makes the unplugged-
+            // camera retry loop show as Recovering, per "Notes: Camera unplug/replug, analyzed").
+            // The wedge-recovery *restart*, however, additionally requires this triggering event
+            // to be handle-invalid: a run of handleInvalid:false failures (no camera present) can
+            // grow the streak arbitrarily without ever restarting, because restarting the process
+            // cannot summon a camera that isn't there -- exactly the unplug analysis's "the
+            // pre-success streak gate requires handle-invalid failures."
+            let streak = state.InitFailStreak + 1
+            let (WallClockMs nowWallMs) = nowWall
+            let wantsRestart = handleInvalid && streak >= config.RecoveryFailureThreshold
+            let stamps, restartDue =
+                requestWedgeRestart (nowWallMs, config.RecoveryCooldownMs, state.Stamps, wantsRestart)
+            let updated =
+                { state with InitFailStreak = streak; Stamps = stamps }
+                |> withRecomputedStatus (config, now)
+            let action = if restartDue then Action.Restart RestartReason.CameraWedged else Action.NoAction
+            { State = updated; Action = action }
         | Event.CaptureFailed ->
-            { State = state; Action = Action.NoAction }
+            // A previously-live capture just died (rfc-core-brain.md, "Notes: recovery
+            // boundary"). Deliberately *not* gated by IsPaused/IsSessionLocked -- unlike Sample,
+            // failure events are pause-immune by design (R2-10): the camera is kept alive while
+            // paused, so its death is a real fact requiring recovery regardless, and this branch
+            // never touches IsPaused/IsSessionLocked, so the restart preserves the pause (the
+            // R1-30 intent) exactly as it preserves every other baseline field it doesn't own.
+            // Once InitSucceeded has occurred, any CaptureFailed requests the restart
+            // unconditionally on its first occurrence, subject only to RecoveryCooldownMs --
+            // never to RecoveryFailureThreshold, and there is no classification to gate on (the
+            // event carries none). Pre-success (HasSucceededOnce = false) cannot occur along the
+            // shell's real call path (MediaCapture.Failed only fires on a live capture) -- kept
+            // as a no-op here for totality rather than as a recovery trigger the RFC never
+            // describes.
+            if not state.HasSucceededOnce then
+                { State = state; Action = Action.NoAction }
+            else
+                let (WallClockMs nowWallMs) = nowWall
+                let stamps, restartDue =
+                    requestWedgeRestart (nowWallMs, config.RecoveryCooldownMs, state.Stamps, true)
+                let updated = { state with Stamps = stamps } |> withRecomputedStatus (config, now)
+                let action = if restartDue then Action.Restart RestartReason.CameraWedged else Action.NoAction
+                { State = updated; Action = action }
 
     /// Computed during `step` and cached in `State` — reflects the world as of the most
     /// recent event, at most one sample interval stale under normal sampling; the shell reads
