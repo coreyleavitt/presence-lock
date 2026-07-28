@@ -137,6 +137,168 @@ let ``never-seen must not lock, even when away/idle/grace are all satisfied`` ()
         Policy.step (someConfig, state, MonotonicMs 20001L, WallClockMs 0L, Event.Sample(Observation.NoFace, 20000L))
     Assert.Equal(Action.NoAction, result.Action)
 
+// --- Slice 4: signal accounting (NoFrame/DarkFrame) -------------------------------------
+
+/// Shared body for the fail-open away-baseline-reset scenario, run against both bad-signal
+/// observations (rfc-core-brain.md: "NoFrame and DarkFrame observations reset the away-
+/// baseline identically to FaceSeen ... but, unlike FaceSeen, do not set armed").
+let private assertBadSignalResetsAwayClockWithoutArming (badObservation: Observation) =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let armedResult =
+        Policy.step (someConfig, state, MonotonicMs 10001L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 20000L))
+    // Away threshold (5000) would already have elapsed by 15001 measured from the FaceSeen
+    // baseline at 10001 -- but a bad-signal blip at 13000 must reset the away clock (fail-open),
+    // not merely pause it.
+    let blipResult =
+        Policy.step (someConfig, armedResult.State, MonotonicMs 13000L, WallClockMs 0L, Event.Sample(badObservation, 20000L))
+    // Only ~2001ms have elapsed since the blip reset -- below AwayThresholdMs (5000) -- so a
+    // NoFace sample here must not lock.
+    let result =
+        Policy.step (
+            someConfig,
+            blipResult.State,
+            MonotonicMs 15001L,
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFace, 20000L)
+        )
+    Assert.Equal(Action.NoAction, result.Action)
+
+[<Fact>]
+let ``a NoFrame blip resets, not merely pauses, the away clock`` () =
+    assertBadSignalResetsAwayClockWithoutArming Observation.NoFrame
+
+[<Fact>]
+let ``a DarkFrame blip resets, not merely pauses, the away clock`` () =
+    assertBadSignalResetsAwayClockWithoutArming Observation.DarkFrame
+
+[<Fact>]
+let ``status becomes NoSignal after continuous bad signal reaches NoSignalReportAfterMs`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    // First bad sample starts the bad-signal clock; not yet reported.
+    let firstBad =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1000L, WallClockMs 0L, Event.Sample(Observation.NoFrame, 0L))
+    Assert.Equal(Status.Watching, Policy.status firstBad.State)
+    // Continuous bad signal (DarkFrame following NoFrame -- both count toward the same run)
+    // reaches NoSignalReportAfterMs (10000) measured from the first bad sample at 1000.
+    let laterBad =
+        Policy.step (
+            someConfig,
+            firstBad.State,
+            MonotonicMs(1000L + someConfig.NoSignalReportAfterMs),
+            WallClockMs 0L,
+            Event.Sample(Observation.DarkFrame, 0L)
+        )
+    Assert.Equal(Status.NoSignal, Policy.status laterBad.State)
+
+[<Fact>]
+let ``continuous bad signal reaching ReevaluateAfterMs requests Action.Restart CameraReevaluation when no cooldown applies`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 1000L, Event.InitSucceeded)
+    let firstBad =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1000L, WallClockMs 1000L, Event.Sample(Observation.NoFrame, 0L))
+    let result =
+        Policy.step (
+            someConfig,
+            firstBad.State,
+            MonotonicMs(1000L + someConfig.ReevaluateAfterMs),
+            WallClockMs 1000L,
+            Event.Sample(Observation.NoFrame, 0L)
+        )
+    Assert.Equal(Action.Restart RestartReason.CameraReevaluation, result.Action)
+
+[<Fact>]
+let ``a cooldown-suppressed CameraReevaluation restart stays saturated and fires immediately once the cooldown clears`` () =
+    // A CameraReevaluation restart happened recently (wall-clock 500) before this process
+    // even started -- randomized initial RestartStamps continuity (R2-19).
+    let stampsRecentReeval: RestartStamps =
+        { WedgeAt = System.Nullable(); ReevalAt = System.Nullable(500L) }
+    let state = Policy.start (MonotonicMs 0L, stampsRecentReeval)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 500L, Event.InitSucceeded)
+    let firstBad =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1000L, WallClockMs 1500L, Event.Sample(Observation.NoFrame, 0L))
+    let thresholdCrossedAt = 1000L + someConfig.ReevaluateAfterMs
+    // Threshold crossed, but only 1000ms of wall-clock have elapsed since ReevalAt (500) --
+    // well under ReevaluateCooldownMs (600000) -- so the restart is suppressed.
+    let suppressed =
+        Policy.step (
+            someConfig,
+            firstBad.State,
+            MonotonicMs thresholdCrossedAt,
+            WallClockMs 1500L,
+            Event.Sample(Observation.NoFrame, 0L)
+        )
+    Assert.Equal(Action.NoAction, suppressed.Action)
+    // Saturated: the bad-signal run does not reset just because the attempt was suppressed --
+    // it stays well past the threshold on the very next sample too (no re-accumulation needed).
+    let stillSuppressed =
+        Policy.step (
+            someConfig,
+            suppressed.State,
+            MonotonicMs(thresholdCrossedAt + 1000L),
+            WallClockMs 2500L,
+            Event.Sample(Observation.NoFrame, 0L)
+        )
+    Assert.Equal(Action.NoAction, stillSuppressed.Action)
+    // Cooldown clears (600000ms wall-clock since ReevalAt = 500) -- fires immediately, not up
+    // to ReevaluateAfterMs later.
+    let cooldownClearedWall = 500L + someConfig.ReevaluateCooldownMs
+    let fired =
+        Policy.step (
+            someConfig,
+            stillSuppressed.State,
+            MonotonicMs(thresholdCrossedAt + 2000L),
+            WallClockMs cooldownClearedWall,
+            Event.Sample(Observation.NoFrame, 0L)
+        )
+    Assert.Equal(Action.Restart RestartReason.CameraReevaluation, fired.Action)
+
+[<Fact>]
+let ``a baseline event resets the signal-health clock, preventing an immediate NoSignal on the next bad sample`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let badRun =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1000L, WallClockMs 0L, Event.Sample(Observation.NoFrame, 0L))
+    // A second InitSucceeded (standing in for the camera re-acquiring) intervenes just before
+    // the original bad run would have reached NoSignalReportAfterMs (10000, i.e. at t=11000).
+    let reinit =
+        Policy.step (
+            someConfig,
+            badRun.State,
+            MonotonicMs(1000L + someConfig.NoSignalReportAfterMs - 1L),
+            WallClockMs 0L,
+            Event.InitSucceeded
+        )
+    // Without the reset, this next bad sample (t=11000, exactly the original run's threshold
+    // crossing) would already show NoSignal; the baseline event must have zeroed the clock.
+    let nextBad =
+        Policy.step (
+            someConfig,
+            reinit.State,
+            MonotonicMs(1000L + someConfig.NoSignalReportAfterMs),
+            WallClockMs 0L,
+            Event.Sample(Observation.NoFrame, 0L)
+        )
+    Assert.Equal(Status.Watching, Policy.status nextBad.State)
+
+[<Fact>]
+let ``dim-light while typing must not lock (regression: fail-closed dim-light lock incident)`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Sample(Observation.FaceSeen, 0L))
+    // A long run of DarkFrame samples while the user is actively typing (idle stays 0) --
+    // must never lock, regardless of how long the dark run continues.
+    let mutable st = armedResult.State
+    let mutable everLocked = false
+    for i in 1 .. 50 do
+        let t = 1L + int64 i * 1000L
+        let result = Policy.step (someConfig, st, MonotonicMs t, WallClockMs 0L, Event.Sample(Observation.DarkFrame, 0L))
+        st <- result.State
+        if result.Action = Action.Lock then
+            everLocked <- true
+    Assert.False(everLocked)
+
 [<Fact>]
 let ``step is still an identity placeholder for event kinds slice 3 does not own (session/pause/recovery)`` () =
     // Sample/InitSucceeded gain real behavior in slice 3 (tested below); the remaining event
@@ -357,3 +519,78 @@ module PropertyTests =
                         if result.Action = Action.Lock then
                             neverLocked <- false
                 neverLocked)
+
+    // --- Properties 4, 6 (rfc-core-brain.md, slice 4) ---------------------------------------
+
+    let private badSignalObservationGen : Gen<Observation> =
+        Gen.elements [ Observation.NoFrame; Observation.DarkFrame ]
+
+    let private badSignalTicksGen : Gen<(int64 * Event) list> =
+        Gen.listOf (
+            gen {
+                let! deltaMs = Gen.choose (0, 20_000) |> Gen.map int64
+                let! obs = badSignalObservationGen
+                let! idleMs = Gen.choose (0, 3_600_000) |> Gen.map int64
+                return (deltaMs, Event.Sample(obs, idleMs))
+            }
+        )
+
+    [<Property>]
+    let ``property 4: NoFrame/DarkFrame sequences alone never produce Action.Lock``
+        (config: PolicyConfig)
+        (stamps: RestartStamps)
+        (startAt: MonotonicMs)
+        =
+        let (MonotonicMs startMs) = startAt
+        Prop.forAll (Arb.fromGen badSignalTicksGen) (fun ticks ->
+            let initialState = Policy.start (MonotonicMs startMs, stamps)
+            let folder (state, nowMs, neverLocked) (deltaMs, event) =
+                let nowMs' = nowMs + deltaMs
+                let result = Policy.step (config, state, MonotonicMs nowMs', WallClockMs 0L, event)
+                (result.State, nowMs', neverLocked && result.Action <> Action.Lock)
+            let _, _, neverLocked = List.fold folder (initialState, startMs, true) ticks
+            neverLocked)
+
+    /// Any event kind may appear — the property is about restart spacing, not about which
+    /// events drive `BadSignalSince` — reusing the full generic `eventGen` from Generators.
+    let private wallTicksGen : Gen<(int64 * Event) list> =
+        Gen.listOf (
+            gen {
+                let! deltaMs = Gen.choose (0, 20_000) |> Gen.map int64
+                let! event = eventGen
+                return (deltaMs, event)
+            }
+        )
+
+    [<Property>]
+    let ``property 6: at most one Action.Restart CameraReevaluation per ReevaluateCooldownMs window``
+        (config: PolicyConfig)
+        (stamps: RestartStamps)
+        (startAt: MonotonicMs)
+        (startWallAt: WallClockMs)
+        =
+        let (MonotonicMs startMs) = startAt
+        let (WallClockMs startWallMs) = startWallAt
+        Prop.forAll (Arb.fromGen wallTicksGen) (fun ticks ->
+            let initialState = Policy.start (MonotonicMs startMs, stamps)
+            let folder (state, nowMs, nowWallMs, fireTimesDesc) (deltaMs, event) =
+                let nowMs' = nowMs + deltaMs
+                let nowWallMs' = nowWallMs + deltaMs
+                let result = Policy.step (config, state, MonotonicMs nowMs', WallClockMs nowWallMs', event)
+                let fireTimesDesc' =
+                    match result.Action with
+                    | Action.Restart RestartReason.CameraReevaluation -> nowWallMs' :: fireTimesDesc
+                    | _ -> fireTimesDesc
+                (result.State, nowMs', nowWallMs', fireTimesDesc')
+            let _, _, _, fireTimesDesc =
+                List.fold folder (initialState, startMs, startWallMs, []) ticks
+            // Prepend the randomized initial stamp (if any restart of this reason ever happened
+            // before this process started) so the property also covers cross-restart cooldown
+            // continuity (R2-19), not merely spacing among fires observed within this run.
+            let fireTimes =
+                match stamps.ReevalAt with
+                | v when v.HasValue -> v.Value :: List.rev fireTimesDesc
+                | _ -> List.rev fireTimesDesc
+            fireTimes
+            |> List.pairwise
+            |> List.forall (fun (a, b) -> b - a >= config.ReevaluateCooldownMs))

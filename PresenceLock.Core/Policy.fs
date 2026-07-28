@@ -54,13 +54,21 @@ module Policy =
     let private withRecomputedStatus (config: PolicyConfig, now: MonotonicMs) (state: State) : State =
         { state with CachedStatus = computeStatus (config, state, now) }
 
-    /// `step` for `Sample`/`InitSucceeded` — the slice-3 lock decision — plus the still-
-    /// unimplemented placeholder cases for event kinds owned by later slices (session/pause:
-    /// slice 5; recovery: slice 6). `NoFrame`/`DarkFrame` observations are also left as identity
-    /// no-ops here: their fail-open away-baseline reset and bad-signal streak accounting is
-    /// slice 4's "Signal accounting" material, deliberately not forward-referenced.
+    /// Wall-clock cooldown check shared by both restart reasons (slice 4 introduces the first
+    /// use, for `ReevaluateCooldownMs`; slice 6's recovery streak reuses this same idiom for
+    /// `RecoveryCooldownMs` per the RFC's slice-6 refactor note — R2-30). An absent stamp
+    /// (never restarted for this reason) always clears the cooldown.
+    let private cooldownElapsed (nowWallMs: int64, cooldownMs: int64, lastRestartAt: System.Nullable<int64>) : bool =
+        if lastRestartAt.HasValue then
+            nowWallMs - lastRestartAt.Value >= cooldownMs
+        else
+            true
+
+    /// `step` for `Sample`/`InitSucceeded` — the slice-3 lock decision, plus slice 4's signal
+    /// accounting for `NoFrame`/`DarkFrame` — and the still-unimplemented placeholder cases for
+    /// event kinds owned by later slices (session/pause: slice 5; recovery: slice 6).
     let step
-        (config: PolicyConfig, state: State, now: MonotonicMs, _nowWall: WallClockMs, event: Event)
+        (config: PolicyConfig, state: State, now: MonotonicMs, nowWall: WallClockMs, event: Event)
         : StepResult =
         match event with
         | Event.Sample(Observation.FaceSeen, _inputIdleMs) ->
@@ -89,6 +97,46 @@ module Policy =
                 else
                     Action.NoAction
             { State = updated; Action = action }
+        | Event.Sample((Observation.NoFrame | Observation.DarkFrame), _inputIdleMs) ->
+            // Fail-open: a `NoFrame`/`DarkFrame` observation resets the away-baseline
+            // identically to `FaceSeen` (both represent "not a valid continuous away
+            // observation") but, unlike `FaceSeen`, never arms.
+            //
+            // Bad-signal-streak start: latched on the first bad sample of a run and carried
+            // forward unchanged by every subsequent bad sample in the same run — this is what
+            // gives the pinned "saturated streak" semantics (R2-27) for free: once
+            // `ReevaluateAfterMs` is crossed and an attempt is cooldown-suppressed, nothing here
+            // ever resets `BadSignalSince`, so the very next sample after the cooldown clears
+            // is already past threshold and fires immediately, rather than re-accumulating up
+            // to `ReevaluateAfterMs` again.
+            let badSignalSince =
+                match state.BadSignalSince with
+                | Some since -> since
+                | None -> now
+            let (MonotonicMs nowMs) = now
+            let (MonotonicMs sinceMs) = badSignalSince
+            let badSignalForMs = nowMs - sinceMs
+            let (WallClockMs nowWallMs) = nowWall
+            let reevaluateDue =
+                badSignalForMs >= config.ReevaluateAfterMs
+                && cooldownElapsed (nowWallMs, config.ReevaluateCooldownMs, state.Stamps.ReevalAt)
+            let stamps =
+                if reevaluateDue then
+                    { state.Stamps with ReevalAt = System.Nullable(nowWallMs) }
+                else
+                    state.Stamps
+            let updated =
+                { state with
+                    AwayBaselineAt = now
+                    BadSignalSince = Some badSignalSince
+                    Stamps = stamps }
+                |> withRecomputedStatus (config, now)
+            let action =
+                if reevaluateDue then
+                    Action.Restart RestartReason.CameraReevaluation
+                else
+                    Action.NoAction
+            { State = updated; Action = action }
         | Event.InitSucceeded ->
             let updated =
                 { state with
@@ -100,8 +148,6 @@ module Policy =
                     InitFailStreak = 0 }
                 |> withRecomputedStatus (config, now)
             { State = updated; Action = Action.NoAction }
-        | Event.Sample(Observation.NoFrame, _)
-        | Event.Sample(Observation.DarkFrame, _)
         | Event.InitFailed _
         | Event.CaptureFailed
         | Event.SessionLocked
