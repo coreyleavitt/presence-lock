@@ -15,6 +15,15 @@ docker run --rm --isolation=hyperv `
     dotnet test PresenceLock.Core.Tests\PresenceLock.Core.Tests.fsproj -c Release
 if ($LASTEXITCODE) { throw 'dotnet test failed' }
 
+docker run --rm --isolation=hyperv `
+    -v "${PSScriptRoot}:C:\src" `
+    -v "presencelock-nuget:C:\nuget" `
+    -e NUGET_PACKAGES=C:\nuget `
+    -w C:\src `
+    $image `
+    dotnet test PresenceLock.Tests\PresenceLock.Tests.csproj -c Release
+if ($LASTEXITCODE) { throw 'dotnet test (shell) failed' }
+
 docker run --rm `
     -v "${PSScriptRoot}:C:\src" `
     -v "presencelock-nuget:C:\nuget" `
