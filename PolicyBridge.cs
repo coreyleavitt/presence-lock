@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Windows.Graphics.Imaging;
 using Core = PresenceLock.Core;
 
 namespace PresenceLock;
@@ -95,6 +96,40 @@ static class PolicyBridge
     /// named in the RFC's slice 8a contract.
     internal static Core.Event ClassifySample(bool haveFrame, bool dark, bool present, long inputIdleMs) =>
         Core.Event.NewSample(ClassifyObservation(haveFrame, dark, present), inputIdleMs);
+
+    /// Picks the largest detected face (by pixel area) and normalizes its bounding box to
+    /// [0,1] by the frame's pixel dimensions, for `PresenceLock.Core`'s `PresenceFilter`
+    /// (spatially-coherent presence stabilization — rfc-core-brain.handoff.md, "Burn-in
+    /// incident 2026-07-28"). Takes `BitmapBounds` (a plain WinRT struct, not `DetectedFace`
+    /// itself — `DetectedFace` has no public constructor and cannot be instantiated outside a
+    /// real `FaceDetector` result, so this signature is the boundary that keeps the selection
+    /// logic unit-testable) so the shell need only pass `faces.Select(f => f.FaceBox)`.
+    /// Normalized so filter coherence is resolution/crop independent regardless of camera
+    /// format or Studio Effects' auto-framing crop changing mid-session. Returns `null` for an
+    /// empty list or a degenerate (zero-dimension) frame — both map to "no detection this
+    /// frame" at the `PresenceFilter.step` boundary.
+    internal static Core.FaceBox? LargestFaceBoxNormalized(IReadOnlyList<BitmapBounds> boxes, uint frameWidth, uint frameHeight)
+    {
+        if (boxes.Count == 0 || frameWidth == 0 || frameHeight == 0) return null;
+
+        var largest = boxes[0];
+        ulong largestArea = (ulong)largest.Width * largest.Height;
+        for (int i = 1; i < boxes.Count; i++)
+        {
+            ulong area = (ulong)boxes[i].Width * boxes[i].Height;
+            if (area > largestArea)
+            {
+                largest = boxes[i];
+                largestArea = area;
+            }
+        }
+
+        return new Core.FaceBox(
+            x: largest.X / (double)frameWidth,
+            y: largest.Y / (double)frameHeight,
+            w: largest.Width / (double)frameWidth,
+            h: largest.Height / (double)frameHeight);
+    }
 
     static readonly Core.RestartStamps EmptyRestartStamps = new(wedgeAt: null, reevalAt: null);
 

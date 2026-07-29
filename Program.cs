@@ -120,6 +120,14 @@ sealed class WatcherContext : ApplicationContext
     // shadow reads live config exactly like a real Advance would.
     Core.PolicyConfig policyConfig;
     Core.State shadowState;
+    // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
+    // raw per-frame FaceDetector output flickers false-positive on an empty scene under a
+    // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/legacy/shadow
+    // logic, so every downstream consumer sees the identical stabilized presence signal.
+    // Reset to `Core.PresenceFilter.initial` wherever a fresh camera acquisition succeeds — see
+    // `StartWatchingAsync` — since spatial coherence measured against a previous acquisition's
+    // frames must never carry into a new one.
+    Core.FilterState presenceFilterState;
     readonly Dictionary<string, int> shadowLogCounts = new();
     readonly NotifyIcon tray;
     readonly ToolStripMenuItem statusItem;
@@ -145,6 +153,16 @@ sealed class WatcherContext : ApplicationContext
     // Locking is disabled until presence has been confirmed at least once per
     // camera acquisition: "never saw you" must fail open, only "lost you" locks.
     bool armed;
+
+    // Sensing diagnostics: the log records decisions only, so a feed that keeps
+    // "seeing" a face produces total silence while locks never fire. Logs
+    // observation-kind transitions and frozen frame timestamps (a pipeline that
+    // stops delivering frames makes TryAcquireLatestFrame re-serve the last
+    // cached frame — indistinguishable from live presence without this).
+    Core.Observation? diagLastObs;
+    TimeSpan? diagLastFrameTime;
+    int diagStaleRun;
+    bool diagStaleLogged;
 
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool LockWorkStation();
@@ -211,6 +229,7 @@ sealed class WatcherContext : ApplicationContext
         shadowState = Core.Policy.start(
             Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
             PolicyBridge.LoadRestartStamps());
+        presenceFilterState = Core.PresenceFilter.initial;
 
         _ = StartWatchingAsync();
     }
@@ -224,6 +243,9 @@ sealed class WatcherContext : ApplicationContext
         graceUntilTick = now + (long)(cfg.GraceSeconds * 1000);
         noSignalStreak = 0;
         armed = false;
+        // Fresh camera = fresh filter: spatial coherence measured against the previous
+        // acquisition's frames must never carry into this one.
+        presenceFilterState = Core.PresenceFilter.initial;
         try
         {
             if (!FaceDetector.IsSupported)
@@ -359,6 +381,39 @@ sealed class WatcherContext : ApplicationContext
         return samples == 0 ? 0 : (double)sum / samples;
     }
 
+    // Pure logging; reads no decision state and writes none — see the diag* field comments.
+    // `present` here is the stabilized PresenceFilter output (SampleAsync sets it before this
+    // call), so `obs`/`diagLastObs` transitions now reflect stabilized observations; `rawFaceCount`
+    // is appended so the raw FaceDetector signal a stabilized FaceSeen/NoFace transition summarizes
+    // is still visible in the log (rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28").
+    void LogSensingDiagnostics(bool haveFrame, bool dark, bool present, TimeSpan? frameTime, long idleMs, int rawFaceCount)
+    {
+        var obs = PolicyBridge.ClassifyObservation(haveFrame, dark, present);
+        if (diagLastObs is null || !obs.Equals(diagLastObs))
+        {
+            Log.Write($"observation: {diagLastObs?.ToString() ?? "(start)"} -> {obs} (idle {idleMs}ms, raw={rawFaceCount} faces)");
+            diagLastObs = obs;
+        }
+        if (!haveFrame || frameTime is null) return;
+        if (frameTime == diagLastFrameTime)
+        {
+            diagStaleRun++;
+            if (diagStaleRun == 10 && !diagStaleLogged)
+            {
+                diagStaleLogged = true;
+                Log.Write($"frame timestamp frozen for {diagStaleRun} consecutive samples (t={frameTime}) — stale feed suspected");
+            }
+        }
+        else
+        {
+            if (diagStaleLogged)
+                Log.Write($"frame timestamp advancing again after {diagStaleRun} stale samples");
+            diagStaleRun = 0;
+            diagStaleLogged = false;
+            diagLastFrameTime = frameTime;
+        }
+    }
+
     async Task SampleAsync()
     {
         if (sampling || paused || sessionLocked || reader is null || detector is null) return;
@@ -366,8 +421,11 @@ sealed class WatcherContext : ApplicationContext
         try
         {
             bool haveFrame = false, present = false, dark = false;
+            TimeSpan? frameTime = null;
+            int rawFaceCount = 0;
             using (var frame = reader.TryAcquireLatestFrame())
             {
+                frameTime = frame?.SystemRelativeTime;
                 var bitmap = frame?.VideoMediaFrame?.SoftwareBitmap;
                 if (bitmap is not null)
                 {
@@ -377,7 +435,16 @@ sealed class WatcherContext : ApplicationContext
                     if (!dark)
                     {
                         var faces = await detector.DetectFacesAsync(gray);
-                        present = faces.Count > 0;
+                        rawFaceCount = faces.Count;
+                        // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in
+                        // incident 2026-07-28"): stepped here, upstream of ClassifySample and
+                        // the legacy decision below, so `present` is the identical stabilized
+                        // signal every downstream consumer (legacy and shadow alike) observes.
+                        var box = PolicyBridge.LargestFaceBoxNormalized(
+                            faces.Select(f => f.FaceBox).ToList(), (uint)gray.PixelWidth, (uint)gray.PixelHeight);
+                        var filterResult = Core.PresenceFilter.step(Core.FilterConfig.Default, presenceFilterState, box);
+                        presenceFilterState = filterResult.State;
+                        present = filterResult.StablePresence;
                     }
                 }
             }
@@ -390,6 +457,7 @@ sealed class WatcherContext : ApplicationContext
             // legacy's observable behavior — it only feeds the shadow core.
             long shadowInputIdleMs = InputIdleMs();
             Core.Event shadowSampleEvent = PolicyBridge.ClassifySample(haveFrame, dark, present, shadowInputIdleMs);
+            LogSensingDiagnostics(haveFrame, dark, present, frameTime, shadowInputIdleMs, rawFaceCount);
 
             if (!haveFrame || dark)
             {

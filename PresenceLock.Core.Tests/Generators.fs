@@ -65,6 +65,20 @@ let eventGen : Gen<Event> =
           Gen.constant Event.Paused
           Gen.constant Event.Resumed ]
 
+/// A normalized face box within the unit frame (rfc-core-brain.handoff.md, "Burn-in incident
+/// 2026-07-28"): width/height are strictly positive — a real detector never reports a
+/// zero-area box — and the box is fully contained in the unit square, matching how the shell
+/// normalizes a detection by the gray frame's `PixelWidth`/`PixelHeight` before calling
+/// `PresenceFilter.step`.
+let faceBoxGen: Gen<FaceBox> =
+    gen {
+        let! w = Gen.choose (1, 100) |> Gen.map (fun i -> float i / 100.0)
+        let! h = Gen.choose (1, 100) |> Gen.map (fun i -> float i / 100.0)
+        let! x = Gen.choose (0, 100) |> Gen.map (fun i -> float i / 100.0 * (1.0 - w))
+        let! y = Gen.choose (0, 100) |> Gen.map (fun i -> float i / 100.0 * (1.0 - h))
+        return { X = x; Y = y; W = w; H = h }
+    }
+
 /// A random wall-clock stamp, or none — the two cases every real `RestartStamps` field takes:
 /// never restarted for this reason (null) vs. restarted at some point in the epoch-ms past.
 let private nullableWallClockGen : Gen<Nullable<int64>> =
@@ -93,3 +107,4 @@ type Generators =
     static member PolicyConfig() = Arb.fromGen policyConfigGen
     static member Event() = Arb.fromGen eventGen
     static member RestartStamps() = Arb.fromGen restartStampsGen
+    static member FaceBox() = Arb.fromGen faceBoxGen

@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <Compile Include="Types.fs" />
+    <Compile Include="PresenceFilter.fs" />
     <Compile Include="Policy.fs" />
   </ItemGroup>
 

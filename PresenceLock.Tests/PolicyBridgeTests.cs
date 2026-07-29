@@ -1,4 +1,5 @@
 using Core = PresenceLock.Core;
+using Windows.Graphics.Imaging;
 using Xunit;
 
 namespace PresenceLock.Tests;
@@ -176,6 +177,58 @@ public class ClassifySampleTests
         var sample = Assert.IsType<Core.Event.Sample>(evt);
         Assert.Equal(Core.Observation.FaceSeen, sample.Item1);
         Assert.Equal(1234, sample.inputIdleMs);
+    }
+}
+
+/// Shell-side helper feeding PresenceLock.Core's PresenceFilter (rfc-core-brain.handoff.md,
+/// "Burn-in incident 2026-07-28"). Takes plain `BitmapBounds` rather than `DetectedFace` itself
+/// so it stays unit-testable: `DetectedFace` has no public constructor and can only be produced
+/// by a real `FaceDetector` result.
+public class LargestFaceBoxNormalizedTests
+{
+    [Fact]
+    public void No_boxes_yields_null()
+    {
+        Assert.Null(PolicyBridge.LargestFaceBoxNormalized(Array.Empty<BitmapBounds>(), frameWidth: 640, frameHeight: 480));
+    }
+
+    [Theory]
+    [InlineData(0u, 480u)]
+    [InlineData(640u, 0u)]
+    public void Degenerate_frame_dimensions_yield_null(uint width, uint height)
+    {
+        var boxes = new[] { new BitmapBounds { X = 0, Y = 0, Width = 100, Height = 100 } };
+        Assert.Null(PolicyBridge.LargestFaceBoxNormalized(boxes, width, height));
+    }
+
+    [Fact]
+    public void Single_box_is_normalized_by_frame_dimensions()
+    {
+        var boxes = new[] { new BitmapBounds { X = 64, Y = 48, Width = 128, Height = 96 } };
+
+        var box = PolicyBridge.LargestFaceBoxNormalized(boxes, frameWidth: 640, frameHeight: 480);
+
+        Assert.NotNull(box);
+        Assert.Equal(0.1, box!.Value.X, 10);
+        Assert.Equal(0.1, box.Value.Y, 10);
+        Assert.Equal(0.2, box.Value.W, 10);
+        Assert.Equal(0.2, box.Value.H, 10);
+    }
+
+    [Fact]
+    public void Multiple_boxes_selects_the_largest_by_pixel_area()
+    {
+        var small = new BitmapBounds { X = 0, Y = 0, Width = 50, Height = 50 };
+        var large = new BitmapBounds { X = 200, Y = 100, Width = 200, Height = 150 };
+        var boxes = new[] { small, large };
+
+        var box = PolicyBridge.LargestFaceBoxNormalized(boxes, frameWidth: 640, frameHeight: 480);
+
+        Assert.NotNull(box);
+        Assert.Equal(large.X / 640.0, box!.Value.X, 10);
+        Assert.Equal(large.Y / 480.0, box.Value.Y, 10);
+        Assert.Equal(large.Width / 640.0, box.Value.W, 10);
+        Assert.Equal(large.Height / 480.0, box.Value.H, 10);
     }
 }
 
