@@ -44,10 +44,10 @@ sealed class Config
     // Mean 8-bit luminance below this is a blocked/dark camera, not an empty room.
     public double DarkFrameMeanThreshold { get; init; } = 6.0;
 
-    // Five new optional PolicyConfig-mapped fields (rfc-core-brain.md, "Config" mapping
-    // table). Existing on-disk files simply lack these keys and get these defaults, exactly
-    // like every other absent field today — the schema stays backward-compatible. Consumed
-    // only by PolicyBridge.BuildPolicyConfig (shadow path); no legacy decision reads them.
+    // Five PolicyConfig-mapped fields (rfc-core-brain.md, "Config" mapping table). Existing
+    // on-disk files simply lack these keys and get these defaults, exactly like every other
+    // absent field today — the schema stays backward-compatible. Consumed only by
+    // PolicyBridge.BuildPolicyConfig; no shell decision code reads them directly.
     public long NoSignalReportAfterMs { get; init; } = 10000;
     public long ReevaluateAfterMs { get; init; } = 20000;
     public long ReevaluateCooldownMs { get; init; } = 600000;
@@ -107,28 +107,29 @@ static class Log
 
 sealed class WatcherContext : ApplicationContext
 {
-    // Consecutive unusable samples before surfacing it in the tray.
-    const int NoFrameReportThreshold = 20;
-    // Consecutive unusable samples between camera re-evaluations (~20s at 500ms),
-    // so docking/undocking moves the watcher to the right camera on its own.
+    // In-process re-init machinery, retained verbatim pending slice 8c (rfc-core-brain.md,
+    // slice 8c: "isolated as its own step so a slice-9 regression is attributable to this
+    // specific, higher-risk change rather than conflated with the parity-preserving cutover").
+    // Neither the constant below nor RestartWatchingAsync/TeardownCameraAsync has any call
+    // site left after this slice — the core's Action.Restart is the only path to a process
+    // restart now, and it never reaches these. Left in place, unreferenced, for 8c to delete
+    // as its own isolated diff.
     const int CameraReinitSamples = 40;
 
     Config cfg;
-    // Shadow-mode core (rfc-core-brain.md, slice 8a): runs alongside the legacy decision
-    // logic below on the same event stream, never executes an Action, and only ever logs
-    // divergences. `policyConfig` is rebuilt whenever `cfg` changes (Settings commit) so the
-    // shadow reads live config exactly like a real Advance would.
+    // The real decision core (rfc-core-brain.md, slice 8b cutover): the sole decision-maker.
+    // `Advance` is the only place `state` is reassigned. `policyConfig` is rebuilt whenever
+    // `cfg` changes (Settings commit) so `step` always reads live config.
     Core.PolicyConfig policyConfig;
-    Core.State shadowState;
+    Core.State state;
     // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
     // raw per-frame FaceDetector output flickers false-positive on an empty scene under a
-    // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/legacy/shadow
-    // logic, so every downstream consumer sees the identical stabilized presence signal.
-    // Reset to `Core.PresenceFilter.initial` wherever a fresh camera acquisition succeeds — see
+    // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/Advance, so every
+    // downstream consumer sees the identical stabilized presence signal. Reset to
+    // `Core.PresenceFilter.initial` wherever a fresh camera acquisition succeeds — see
     // `StartWatchingAsync` — since spatial coherence measured against a previous acquisition's
     // frames must never carry into a new one.
     Core.FilterState presenceFilterState;
-    readonly Dictionary<string, int> shadowLogCounts = new();
     readonly NotifyIcon tray;
     readonly ToolStripMenuItem statusItem;
     readonly ToolStripMenuItem pauseItem;
@@ -140,19 +141,19 @@ sealed class WatcherContext : ApplicationContext
     MediaCapture? capture;
     MediaFrameReader? reader;
 
-    long lastFaceTick;
-    long graceUntilTick;
-    int noSignalStreak;
-    int initFailStreak;
     byte[]? lumaBuf;
-    bool paused;
-    bool sessionLocked;
     bool sampling;
     bool starting;
     bool settingsOpen;
-    // Locking is disabled until presence has been confirmed at least once per
-    // camera acquisition: "never saw you" must fail open, only "lost you" locks.
-    bool armed;
+    // The shell's own current-sample dark-vs-no-frame knowledge (rfc-core-brain.md:
+    // "Status.NoSignal does not distinguish dark vs. no-frame ... the shell already computed
+    // that distinction itself one line before constructing the Observation"). Set every sample
+    // in SampleAsync, read only for rendering/logging the finer-grained NoSignal text — never
+    // fed back into Core, never a decision input.
+    bool lastObservationDark;
+    // Dedup for the tray/status render (rfc-core-brain.md: "the shell ... re-renders only when
+    // the rendered string differs").
+    string? lastRenderedStatusText;
 
     // Sensing diagnostics: the log records decisions only, so a feed that keeps
     // "seeing" a face produces total silence while locks never fire. Logs
@@ -189,6 +190,7 @@ sealed class WatcherContext : ApplicationContext
         ui = SynchronizationContext.Current!;
 
         statusItem = new ToolStripMenuItem("Starting…") { Enabled = false };
+        lastRenderedStatusText = "Starting…";
         pauseItem = new ToolStripMenuItem("Pause", null, (_, _) => TogglePause());
         var menu = new ContextMenuStrip();
         menu.Items.Add(statusItem);
@@ -215,21 +217,33 @@ sealed class WatcherContext : ApplicationContext
         retryTimer.Tick += async (_, _) =>
         {
             retryTimer.Stop();
-            if (!paused && !sessionLocked && reader is null) await StartWatchingAsync();
+            // Retry-timer gate (rfc-core-brain.md R2-15): the complete, core-owned test —
+            // replaces the legacy `!paused && !sessionLocked` shell-local booleans. This is one
+            // of the three call sites sharing the identical status gate (R2-4); the other two
+            // are the direct KickAcquisitionIfNeeded() calls below.
+            if (reader is null && PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state)))
+                await StartWatchingAsync();
         };
 
         SystemEvents.SessionSwitch += OnSessionSwitch;
 
         Log.Write($"started (threshold {cfg.AwayThresholdSeconds}s, sample {cfg.SampleIntervalMs}ms)");
 
-        // Policy.start is called exactly once per process, before the first camera-
-        // acquisition attempt (rfc-core-brain.md, Policy.start doc comment). Stamps come from
-        // the RFC's new stamps file if one exists, else empty — nothing writes that file yet
-        // in shadow mode (8b/8c wire real Action.Restart execution and persistence).
-        shadowState = Core.Policy.start(
+        // Policy.start is called exactly once per process, before the first camera-acquisition
+        // attempt (rfc-core-brain.md, Policy.start doc comment).
+        state = Core.Policy.start(
             Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
             PolicyBridge.LoadRestartStamps());
         presenceFilterState = Core.PresenceFilter.initial;
+
+        // Paused-flag consume-and-clear (rfc-core-brain.md R2-11, pinned lifecycle): read →
+        // feed Event.Paused through Advance immediately after Policy.start → rewrite cleared.
+        // Written only by RestartProcess, immediately before spawn — so pause survives every
+        // self-restart, but a tray Exit or a normal launch never inherits a stale pause.
+        if (PolicyBridge.ConsumePersistedPausedFlag())
+        {
+            Advance(Core.Event.Paused);
+        }
 
         _ = StartWatchingAsync();
     }
@@ -238,11 +252,6 @@ sealed class WatcherContext : ApplicationContext
     {
         if (starting) return;
         starting = true;
-        long now = Environment.TickCount64;
-        lastFaceTick = now;
-        graceUntilTick = now + (long)(cfg.GraceSeconds * 1000);
-        noSignalStreak = 0;
-        armed = false;
         // Fresh camera = fresh filter: spatial coherence measured against the previous
         // acquisition's frames must never carry into this one.
         presenceFilterState = Core.PresenceFilter.initial;
@@ -251,46 +260,33 @@ sealed class WatcherContext : ApplicationContext
             if (!FaceDetector.IsSupported)
             {
                 Log.Write("FaceDetector.IsSupported == false — idle");
-                SetStatus("Face detection unsupported — idle");
+                SetRawStatusText("Face detection unsupported — idle");
                 return;
             }
             detector ??= await FaceDetector.CreateAsync();
             if (reader is null) await InitCameraAsync();
-            initFailStreak = 0;
-            // Baseline the grace window from successful acquisition, not from
-            // when this attempt began — slow init must not consume the grace.
-            now = Environment.TickCount64;
-            lastFaceTick = now;
-            graceUntilTick = now + (long)(cfg.GraceSeconds * 1000);
-            ShadowAdvance(Core.Event.InitSucceeded);
+            if (Advance(Core.Event.InitSucceeded)) return; // process restarting (unreachable for this event, but see Advance's contract)
             sampleTimer.Start();
-            SetStatus("Watching");
         }
         catch (Exception ex)
         {
-            initFailStreak++;
-            Log.Write($"start failed ({initFailStreak}, hr=0x{ex.HResult:X8}, t{Environment.CurrentManagedThreadId}): {ex.Message.Trim()}");
             TeardownCamera();
 
-            // Persistent E_HANDLE from a fresh MediaCapture means this
-            // process's connection to the camera FrameServer is wedged
-            // (seen after lock/unlock cycles); only a new process recovers.
-            // Match on message too: the WinRT projection wraps the error and
-            // does not always preserve the E_HANDLE HResult.
-            // A persisted 10-minute cooldown lets recovery fire repeatedly over
-            // time while stopping a broken camera from causing a restart loop.
+            // Persistent E_HANDLE from a fresh MediaCapture means this process's connection to
+            // the camera FrameServer is wedged (seen after lock/unlock cycles); only a new
+            // process recovers. Match on message too: the WinRT projection wraps the error and
+            // does not always preserve the E_HANDLE HResult. Advance(InitFailed) is the core's
+            // only gate on that decision now — streak + handle-invalid classification +
+            // wall-clock cooldown persisted across restarts (rfc-core-brain.md, "Notes:
+            // recovery boundary").
             bool handleInvalid = PolicyBridge.IsHandleInvalid(ex);
-            ShadowAdvance(Core.Event.NewInitFailed(handleInvalid));
-            if (initFailStreak >= 3 && handleInvalid && RestartCooldownElapsed())
-            {
-                Log.Write("camera stack wedged — restarting process to recover");
-                MarkRestart();
-                RestartProcess();
-                return;
-            }
+            if (Advance(Core.Event.NewInitFailed(handleInvalid))) return; // Action.Restart executed — process exiting
 
-            SetStatus("Camera unavailable — retrying");
-            retryTimer.Start();
+            var snap = Core.Policy.snapshot(policyConfig, state, Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64));
+            Log.Write($"start failed ({snap.InitFailStreak}, hr=0x{ex.HResult:X8}, t{Environment.CurrentManagedThreadId}): {ex.Message.Trim()}");
+
+            if (reader is null && PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state)))
+                retryTimer.Start();
         }
         finally
         {
@@ -298,14 +294,15 @@ sealed class WatcherContext : ApplicationContext
         }
     }
 
-    // Rapid teardown → re-init cycles wedge the FrameServer connection
-    // (persistent E_HANDLE); always let the capture stack settle between them.
+    // In-process re-init machinery, retained verbatim pending slice 8c (see the class-level
+    // comment on CameraReinitSamples). No call site reaches this method after the 8b cutover —
+    // the core's Action.Restart, executed via RestartProcess(), is the only recovery path now.
     async Task RestartWatchingAsync()
     {
         sampleTimer.Stop();
         await TeardownCameraAsync();
         await Task.Delay(1500);
-        if (!paused && !sessionLocked) await StartWatchingAsync();
+        if (PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state))) await StartWatchingAsync();
     }
 
     // Stop the frame reader gracefully before disposing; hard-disposing an
@@ -416,15 +413,22 @@ sealed class WatcherContext : ApplicationContext
 
     async Task SampleAsync()
     {
-        if (sampling || paused || sessionLocked || reader is null || detector is null) return;
+        if (sampling || detector is null) return;
+        // Defense in depth (rfc-core-brain.md, "Sample events outside the watching window"):
+        // Core already no-ops a Sample while Paused/SessionLocked, but discard here too rather
+        // than pay for a frame acquisition and face-detection pass that can't matter — the
+        // sampleTimer is stopped in both states anyway, so this only guards a narrow race.
+        var currentStatus = Core.Policy.status(state);
+        if (currentStatus.Tag == Core.Status.Tags.Paused || currentStatus.Tag == Core.Status.Tags.SessionLocked) return;
         sampling = true;
         try
         {
             bool haveFrame = false, present = false, dark = false;
             TimeSpan? frameTime = null;
             int rawFaceCount = 0;
-            using (var frame = reader.TryAcquireLatestFrame())
+            if (reader is not null)
             {
+                using var frame = reader.TryAcquireLatestFrame();
                 frameTime = frame?.SystemRelativeTime;
                 var bitmap = frame?.VideoMediaFrame?.SoftwareBitmap;
                 if (bitmap is not null)
@@ -438,8 +442,8 @@ sealed class WatcherContext : ApplicationContext
                         rawFaceCount = faces.Count;
                         // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in
                         // incident 2026-07-28"): stepped here, upstream of ClassifySample and
-                        // the legacy decision below, so `present` is the identical stabilized
-                        // signal every downstream consumer (legacy and shadow alike) observes.
+                        // Advance, so `present` is the identical stabilized signal every
+                        // downstream consumer observes.
                         var box = PolicyBridge.LargestFaceBoxNormalized(
                             faces.Select(f => f.FaceBox).ToList(), (uint)gray.PixelWidth, (uint)gray.PixelHeight);
                         var filterResult = Core.PresenceFilter.step(Core.FilterConfig.Default, presenceFilterState, box);
@@ -448,73 +452,17 @@ sealed class WatcherContext : ApplicationContext
                     }
                 }
             }
+            // `reader is null` here (a cooldown-suppressed CaptureFailed backstop —
+            // rfc-core-brain.md, "Notes: recovery boundary") falls straight through as
+            // haveFrame=false, i.e. Observation.NoFrame — the shell keeps sampleTimer running
+            // so the NoFrame → re-evaluation backstop engages on the ordinary signal-health path,
+            // with no separate mechanism.
 
-            long now = Environment.TickCount64;
-            // Shadow-only read (rfc-core-brain.md, slice 8a): the shared Sample event always
-            // carries an inputIdleMs value, but legacy's own lock check below only reads idle
-            // time lazily, inside its short-circuited &&-chain. GetLastInputInfo is a
-            // stateless, side-effect-free query, so reading it here too does not change
-            // legacy's observable behavior — it only feeds the shadow core.
-            long shadowInputIdleMs = InputIdleMs();
-            Core.Event shadowSampleEvent = PolicyBridge.ClassifySample(haveFrame, dark, present, shadowInputIdleMs);
-            LogSensingDiagnostics(haveFrame, dark, present, frameTime, shadowInputIdleMs, rawFaceCount);
-
-            if (!haveFrame || dark)
-            {
-                // Fail open: no frame (privacy shutter, exclusive use elsewhere,
-                // warm-up) or a black feed (lid-closed internal camera, capped
-                // lens) must never lock the machine.
-                lastFaceTick = now;
-                noSignalStreak++;
-                if (noSignalStreak == NoFrameReportThreshold)
-                {
-                    Log.Write(dark ? "camera feed dark/blocked — failing open"
-                                   : "camera delivering no frames — failing open");
-                    SetStatus(dark ? "Camera dark/blocked — not locking"
-                                   : "No camera frames — not locking");
-                }
-                if (noSignalStreak % CameraReinitSamples == 0)
-                {
-                    Log.Write("no usable signal — re-evaluating cameras");
-                    _ = RestartWatchingAsync();
-                }
-                // Core never emits Action.Lock for NoFrame/DarkFrame (fail-open by design),
-                // so legacy's would-lock is definitionally false here — no comparison needed.
-                ShadowAdvance(shadowSampleEvent, legacyWouldLock: false);
-                return;
-            }
-            if (noSignalStreak >= NoFrameReportThreshold) SetStatus("Watching");
-            noSignalStreak = 0;
-
-            bool legacyWouldLock = false;
-            if (present)
-            {
-                if (!armed)
-                {
-                    armed = true;
-                    Log.Write("presence confirmed — armed");
-                }
-                lastFaceTick = now;
-            }
-            else
-            {
-                legacyWouldLock = armed && now >= graceUntilTick &&
-                    now - lastFaceTick >= (long)(cfg.AwayThresholdSeconds * 1000) &&
-                    InputIdleMs() >= (long)(cfg.InputIdleSeconds * 1000);
-                if (legacyWouldLock)
-                {
-                    Log.Write($"no face for {cfg.AwayThresholdSeconds}s, input idle — locking");
-                    sessionLocked = true;
-                    sampleTimer.Stop();
-                    if (!LockWorkStation())
-                    {
-                        sessionLocked = false;
-                        Log.Write($"LockWorkStation failed: {Marshal.GetLastWin32Error()}");
-                        sampleTimer.Start();
-                    }
-                }
-            }
-            ShadowAdvance(shadowSampleEvent, legacyWouldLock);
+            long idleMs = InputIdleMs();
+            lastObservationDark = dark;
+            Core.Event sampleEvent = PolicyBridge.ClassifySample(haveFrame, dark, present, idleMs);
+            LogSensingDiagnostics(haveFrame, dark, present, frameTime, idleMs, rawFaceCount);
+            Advance(sampleEvent);
         }
         catch (Exception ex)
         {
@@ -531,174 +479,202 @@ sealed class WatcherContext : ApplicationContext
     // FrameServer wedge followed a re-init from this handler — so marshal
     // the entire body onto the UI thread before touching the camera.
     void OnSessionSwitch(object? sender, SessionSwitchEventArgs e) =>
-        ui.Post(async _ =>
+        ui.Post(_ =>
         {
             if (e.Reason == SessionSwitchReason.SessionLock)
             {
-                sessionLocked = true;
                 sampleTimer.Stop();
-                SetStatus("Session locked — watching paused");
-                ShadowAdvance(Core.Event.SessionLocked);
+                Advance(Core.Event.SessionLocked);
             }
             else if (e.Reason == SessionSwitchReason.SessionUnlock)
             {
-                sessionLocked = false;
-                // Fed to the shadow core unconditionally, even while paused: the
-                // pause-precedence rule (SessionUnlocked while paused is a no-op) is core-
-                // owned, not shell-owned — see rfc-core-brain.md's pause/unlock truth table.
-                ShadowAdvance(Core.Event.SessionUnlocked);
-                if (paused) return;
+                // Fed to Core unconditionally, even while paused: the pause-precedence rule
+                // (SessionUnlocked while paused is a no-op) is core-owned, not shell-owned —
+                // see rfc-core-brain.md's pause/unlock truth table.
+                Advance(Core.Event.SessionUnlocked);
+                if (Core.Policy.status(state).Tag == Core.Status.Tags.Paused) return;
+
                 if (reader is not null)
                 {
-                    // The camera deliberately stays alive across the lock:
-                    // on this machine, tearing down and re-initializing
-                    // MediaCapture wedges the FrameServer service itself
-                    // (persistent E_HANDLE for every process until an elevated
+                    // The camera deliberately stays alive across the lock: on this machine,
+                    // tearing down and re-initializing MediaCapture wedges the FrameServer
+                    // service itself (persistent E_HANDLE for every process until an elevated
                     // service restart). Initialize once, never re-initialize.
                     Log.Write("resumed after unlock (camera kept alive)");
-                    ResumeSampling();
+                    sampleTimer.Start();
                 }
-                else
-                {
-                    await RestartWatchingAsync();
-                }
+                // KickAcquisitionIfNeeded (rfc-core-brain.md R2-4) — one of the three call
+                // sites sharing the core-owned status gate: names the mechanism today's code
+                // implements as a direct StartWatchingAsync() call, so the self-stopping retry
+                // timer isn't the only thing that can reacquire after a lock/pause.
+                KickAcquisitionIfNeeded();
             }
         }, null);
 
     void OnCaptureFailed(MediaCapture sender, MediaCaptureFailedEventArgs args) =>
         ui.Post(_ =>
         {
-            Log.Write($"capture failed: {args.Message}");
-            // CaptureFailed is flagless (rfc-core-brain.md, "Notes: recovery boundary"): the
-            // restart decision no longer depends on classification once InitSucceeded has
-            // occurred. IsHandleInvalid(args.Code, args.Message) still exists and is unit-
-            // tested (R2-7's args-form requirement) for the log-line mapping 8b adds.
-            ShadowAdvance(Core.Event.CaptureFailed);
+            // IsHandleInvalid still classifies here for this log line only (rfc-core-brain.md,
+            // "Notes: recovery boundary" / R2-7's args-form requirement) — the restart decision
+            // itself no longer depends on the classification once InitSucceeded has occurred.
+            bool handleInvalid = PolicyBridge.IsHandleInvalid(unchecked((int)args.Code), args.Message);
+            Log.Write($"capture failed{(handleInvalid ? " (handle invalid)" : "")}: {args.Message}");
+            // CaptureFailed is flagless: Advance requests Action.Restart CameraWedged
+            // unconditionally on first occurrence post-success, subject only to
+            // RecoveryCooldownMs — never gated by Paused/SessionLocked (failure events are
+            // pause-immune by design, unlike Sample).
+            if (Advance(Core.Event.CaptureFailed)) return; // Action.Restart executed — process exiting
+            // Cooldown-suppressed backstop: tear down the dead capture (reader null) but keep
+            // sampleTimer running — SampleAsync's null-reader path emits NoFrame, and the
+            // ordinary signal-health machinery carries the rest (no new mechanism).
             TeardownCamera();
-            if (!paused && !sessionLocked)
-            {
-                SetStatus("Camera failed — retrying");
-                retryTimer.Start();
-            }
         }, null);
 
     void TogglePause()
     {
-        paused = !paused;
-        if (paused)
+        bool isPaused = Core.Policy.status(state).Tag == Core.Status.Tags.Paused;
+        if (!isPaused)
         {
             sampleTimer.Stop();
             retryTimer.Stop();
-            SetStatus("Paused — camera kept open");
             Log.Write("paused");
-            ShadowAdvance(Core.Event.Paused);
+            Advance(Core.Event.Paused);
         }
         else
         {
             Log.Write("resumed");
-            ShadowAdvance(Core.Event.Resumed);
-            if (reader is not null) ResumeSampling();
-            else _ = StartWatchingAsync();
+            Advance(Core.Event.Resumed);
+            if (reader is not null) sampleTimer.Start();
+            // KickAcquisitionIfNeeded — second of the three R2-4 call sites.
+            KickAcquisitionIfNeeded();
         }
     }
 
-    // Re-baseline and resume sampling on an already-initialized camera.
-    void ResumeSampling()
+    // KickAcquisitionIfNeeded (rfc-core-brain.md R2-4): the complete, core-owned gate for
+    // "should we attempt (re)acquisition" — replaces the legacy shell-local
+    // `!paused && !sessionLocked` booleans with the single status test shared by the retry
+    // timer's Tick guard and both direct call sites below.
+    void KickAcquisitionIfNeeded()
     {
-        long t = Environment.TickCount64;
-        lastFaceTick = t;
-        graceUntilTick = t + (long)(cfg.GraceSeconds * 1000);
-        armed = false;
-        noSignalStreak = 0;
-        sampleTimer.Start();
-        SetStatus("Watching");
+        if (reader is null && PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state)))
+            _ = StartWatchingAsync();
     }
 
-    // Shadow-mode chokepoint (rfc-core-brain.md, slice 8a): every call site feeds the same
-    // Event the real 8b Advance will eventually consume, via the shared event-construction
-    // functions in PolicyBridge. This method holds its own core State and NEVER executes the
-    // returned Action — legacy remains in full control of all real behavior. `legacyWouldLock`
-    // is non-null only at the Sample call site; the RFC scopes divergence to exactly the
-    // would-lock boolean, so every other call site passes null and skips the comparison.
-    void ShadowAdvance(Core.Event evt, bool? legacyWouldLock = null)
+    // The single Advance(Event) chokepoint (rfc-core-brain.md, slice 8b cutover): the only
+    // place `state` is reassigned. Computes now/nowWall back to back, calls Policy.step,
+    // executes the returned Action, logs Policy.snapshot alongside Lock/Restart (R1-34), logs
+    // the once-per-episode dark-vs-no-frame transition into Status.NoSignal (R2-29), and
+    // re-renders tray/status + pauseItem.Text from Policy.status — never from a shell-local
+    // bool. Returns true iff an Action.Restart was executed (the process is exiting via
+    // RestartProcess/ExitThread) so callers can skip any further work that assumes the process
+    // keeps running.
+    bool Advance(Core.Event evt)
     {
         long now = Environment.TickCount64;
         long nowWallMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var monotonic = Core.MonotonicMs.NewMonotonicMs(now);
-        var result = Core.Policy.step(
-            policyConfig, shadowState, monotonic, Core.WallClockMs.NewWallClockMs(nowWallMs), evt);
-        shadowState = result.State;
+        var nowWall = Core.WallClockMs.NewWallClockMs(nowWallMs);
+        var previousStatus = Core.Policy.status(state);
 
-        // F#-generated DU cases without data (NoAction/Lock) are exposed as static properties
-        // of the union's own type, so `case Core.Action.Lock:` cannot be used as a C# type
-        // pattern here (it resolves to the property, not a distinct type — CS9135). Switch on
-        // the generated `.Tag`/`Tags` int constants instead; `Action.Restart` still downcasts
-        // for its `reason` field.
-        bool shadowWouldLock = false;
+        var result = Core.Policy.step(policyConfig, state, monotonic, nowWall, evt);
+        state = result.State;
+        var newStatus = Core.Policy.status(state);
+
         switch (result.Action.Tag)
         {
             case Core.Action.Tags.NoAction:
                 break;
             case Core.Action.Tags.Lock:
-                shadowWouldLock = true;
+                ExecuteLock();
                 break;
             case Core.Action.Tags.Restart:
-                // Restart-shaped decisions have no legacy analog by design (the RFC's two
-                // deliberate behavior changes) — logged, never counted as a divergence.
                 var restart = (Core.Action.Restart)result.Action;
-                LogShadowExpected(restart.reason);
-                break;
+                ExecuteRestart(restart.reason, monotonic);
+                return true;
             default:
                 throw new UnreachableException();
         }
 
-        if (legacyWouldLock is bool legacyLock && legacyLock != shadowWouldLock)
+        // Status/log-line mapping table (slice 8b deliverable): the once-per-episode
+        // dark-vs-no-frame diagnostic fires exactly on the transition into Status.NoSignal,
+        // from the shell's own current-sample classification (Core doesn't echo it back).
+        if (newStatus.Tag == Core.Status.Tags.NoSignal && previousStatus.Tag != Core.Status.Tags.NoSignal)
         {
-            var snap = Core.Policy.snapshot(policyConfig, shadowState, monotonic);
-            string kind = shadowWouldLock ? "shadow-lock-legacy-noaction" : "legacy-lock-shadow-noaction";
-            LogDivergence(kind,
-                $"legacyWouldLock={legacyLock} shadowWouldLock={shadowWouldLock} " +
-                $"armed={snap.Armed} inGrace={snap.InGrace} awayForMs={snap.AwayForMs} " +
-                $"noSignalForMs={snap.NoSignalForMs} initFailStreak={snap.InitFailStreak}");
+            Log.Write(lastObservationDark
+                ? "camera feed dark/blocked — failing open"
+                : "camera delivering no frames — failing open");
+        }
+
+        Render(newStatus);
+        return false;
+    }
+
+    // Action.Lock execution discipline (rfc-core-brain.md R2-18): stop sampleTimer
+    // synchronously BEFORE calling LockWorkStation(), restarting it only if the Win32 call
+    // fails — preserving the guard against a second timer tick re-deriving Lock in the window
+    // before the real OS SessionLock notification arrives. Core takes no side-channel action on
+    // a failed lock (Action.Lock is a stateless, re-derived request); the very next qualifying
+    // Sample independently re-evaluates and re-emits Lock if conditions still hold.
+    void ExecuteLock()
+    {
+        sampleTimer.Stop();
+        var snap = Core.Policy.snapshot(policyConfig, state, Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64));
+        Log.Write($"no face for {cfg.AwayThresholdSeconds}s, input idle — locking " +
+                  $"(armed={snap.Armed} inGrace={snap.InGrace} awayForMs={snap.AwayForMs} " +
+                  $"noSignalForMs={snap.NoSignalForMs} initFailStreak={snap.InitFailStreak})");
+        if (!LockWorkStation())
+        {
+            Log.Write($"LockWorkStation failed: {Marshal.GetLastWin32Error()}");
+            sampleTimer.Start();
         }
     }
 
-    static string RestartReasonTag(Core.RestartReason reason)
+    // Logs Policy.snapshot alongside the restart reason (R1-34), then hands off to the
+    // mechanical RestartProcess() — RestartReason changes only the log line, never the restart
+    // mechanism (rfc-core-brain.md, "Shell changes").
+    void ExecuteRestart(Core.RestartReason reason, Core.MonotonicMs monotonic)
     {
-        switch (reason.Tag)
+        var snap = Core.Policy.snapshot(policyConfig, state, monotonic);
+        string message = reason.Tag switch
         {
-            case Core.RestartReason.Tags.CameraWedged: return "CameraWedged";
-            case Core.RestartReason.Tags.CameraReevaluation: return "CameraReevaluation";
-            default: throw new UnreachableException();
-        }
+            Core.RestartReason.Tags.CameraWedged =>
+                $"camera stack wedged — restarting process to recover " +
+                $"(initFailStreak={snap.InitFailStreak}, noSignalForMs={snap.NoSignalForMs})",
+            Core.RestartReason.Tags.CameraReevaluation =>
+                $"no usable signal — re-evaluating cameras (noSignalForMs={snap.NoSignalForMs})",
+            _ => throw new UnreachableException(),
+        };
+        Log.Write(message);
+        RestartProcess();
     }
 
-    void LogShadowExpected(Core.RestartReason reason)
+    // Renders tray/status text and pauseItem.Text from Policy.status — the second render
+    // target the RFC calls out explicitly as easy to drop silently (R2-... "SetStatus's second
+    // render target is on the 8b checklist too"): pauseItem.Text derives from
+    // Policy.status(state) = Status.Paused, never from a shell-local bool. Tray/status text is
+    // re-rendered only when it actually changes (Policy.status is pulled, never pushed).
+    void Render(Core.Status status)
     {
-        string kind = $"SHADOW-EXPECTED[{RestartReasonTag(reason)}]";
-        LogShadowOnce(kind, $"{kind}: shadow core requested Restart — no legacy analog, not a divergence");
+        string text = PolicyBridge.StatusText(status, lastObservationDark);
+        if (text != lastRenderedStatusText)
+        {
+            lastRenderedStatusText = text;
+            statusItem.Text = text;
+            var tip = $"PresenceLock — {text}";
+            tray.Text = tip.Length <= 63 ? tip : tip[..63];
+        }
+        pauseItem.Text = status.Tag == Core.Status.Tags.Paused ? "Resume" : "Pause";
     }
 
-    void LogDivergence(string kind, string detail) =>
-        LogShadowOnce($"SHADOW-DIVERGENCE[{kind}]", $"SHADOW-DIVERGENCE[{kind}]: {detail}");
-
-    // Repeat-suppression (rfc-core-brain.md, slice 8a): the first occurrence of each distinct
-    // kind this process run is logged in full; every later occurrence logs only a short
-    // count line, so a cascading divergence can't blow the 1 MB log cap and evict its own
-    // most diagnostic first occurrence.
-    void LogShadowOnce(string kind, string fullDetail)
+    // Raw text setter for the one hard-stop path outside the Status model: FaceDetector not
+    // being supported on this machine at all, before any camera-acquisition attempt is even
+    // made (Policy never sees an event in this case).
+    void SetRawStatusText(string text)
     {
-        if (shadowLogCounts.TryGetValue(kind, out int count))
-        {
-            count++;
-            shadowLogCounts[kind] = count;
-            Log.Write($"{kind} (repeat #{count})");
-        }
-        else
-        {
-            shadowLogCounts[kind] = 1;
-            Log.Write(fullDetail);
-        }
+        lastRenderedStatusText = text;
+        statusItem.Text = text;
+        var tip = $"PresenceLock — {text}";
+        tray.Text = tip.Length <= 63 ? tip : tip[..63];
     }
 
     void TeardownCamera()
@@ -708,14 +684,6 @@ sealed class WatcherContext : ApplicationContext
         reader = null;
         try { capture?.Dispose(); } catch (Exception ex) { Log.Write($"capture dispose: {ex.Message}"); }
         capture = null;
-    }
-
-    void SetStatus(string text)
-    {
-        statusItem.Text = text;
-        pauseItem.Text = paused ? "Resume" : "Pause";
-        var tip = $"PresenceLock — {text}";
-        tray.Text = tip.Length <= 63 ? tip : tip[..63];
     }
 
     async void OpenSettings()
@@ -746,8 +714,9 @@ sealed class WatcherContext : ApplicationContext
             cfg = form.Result;
             SaveConfig(cfg);
             // Live config (rfc-core-brain.md, "Notes"): PolicyConfig is read live on every
-            // step, so the shadow core must see a committed Settings change on the very next
-            // sample too, via the same shared mapping function file-load uses.
+            // step, so a committed Settings change must be visible on the very next sample too,
+            // via the same shared mapping function file-load uses (BuildPolicyConfig) — the
+            // Settings commit path routes through it already; nothing else to wire here.
             policyConfig = PolicyBridge.BuildPolicyConfig(cfg);
             sampleTimer.Interval = cfg.SampleIntervalMs;
             Log.Write($"config updated (threshold {cfg.AwayThresholdSeconds}s, " +
@@ -755,9 +724,11 @@ sealed class WatcherContext : ApplicationContext
                       $"camera filter '{cfg.CameraNameContains}')");
             if (!string.Equals(oldFilter, cfg.CameraNameContains, StringComparison.OrdinalIgnoreCase))
             {
-                // Switching cameras needs a re-init, and in-process re-init
-                // wedges the FrameServer on this machine — restart the whole
-                // process instead; a fresh process's first init is reliable.
+                // Switching cameras needs a re-init, and in-process re-init wedges the
+                // FrameServer on this machine — restart the whole process instead; a fresh
+                // process's first init is reliable. Shell-only mechanical decision (trivial
+                // string comparison, not policy) — not routed through Policy, and
+                // RestartReason is not extended for it (rfc-core-brain.md, "Shell changes").
                 Log.Write("camera filter changed — restarting process to switch cameras");
                 RestartProcess();
             }
@@ -782,42 +753,36 @@ sealed class WatcherContext : ApplicationContext
         return SystemIcons.Application;
     }
 
+    // Mechanical restart, shared by every restart trigger — core-driven (via ExecuteRestart)
+    // and shell-driven (the Settings camera-filter-change path) alike: RestartReason changes
+    // only the log line, never this mechanism. Ordering audited per rfc-core-brain.md
+    // R1-23/R2-25: stop timers → write stamps/paused flag → release mutex → spawn →
+    // ExitThread() — timers stop before the mutex is released and the new process is spawned
+    // (closing the handoff window where both processes could theoretically be live
+    // simultaneously), and the stamps-file write completes before Process.Start() (the
+    // child's Policy.start correctness depends on what is on disk at spawn time).
     void RestartProcess()
     {
+        sampleTimer.Stop();
+        retryTimer.Stop();
+
+        // Policy.status(state) == Paused is a reliable proxy for the core's internal IsPaused
+        // flag: Paused outranks every other Status in the priority table, so IsPaused true
+        // implies Status.Paused and vice versa — no need for Snapshot to expose IsPaused
+        // separately just for this.
+        bool isPaused = Core.Policy.status(state).Tag == Core.Status.Tags.Paused;
+        var snap = Core.Policy.snapshot(policyConfig, state, Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64));
+        // The shell writes only the stamp for the reason it executed (R1-29): Policy.step
+        // itself only ever bumps the one RestartStamps field matching the fired reason, so
+        // snap.LastWedgeRestartAt/LastReevalRestartAt already carry that property — a plain
+        // round-trip here can't poison the other reason's cooldown.
+        var stamps = new Core.RestartStamps(wedgeAt: snap.LastWedgeRestartAt, reevalAt: snap.LastReevalRestartAt);
+        PolicyBridge.SaveRestartStamps(stamps, isPaused);
+
         Program.SingleInstance?.ReleaseMutex();
         Program.SingleInstance?.Dispose();
         Process.Start(new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false });
         ExitThread();
-    }
-
-    static readonly string RestartStampPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PresenceLock", "last-restart.txt");
-
-    static bool RestartCooldownElapsed()
-    {
-        try
-        {
-            return !File.Exists(RestartStampPath) ||
-                DateTime.UtcNow - File.GetLastWriteTimeUtc(RestartStampPath) >= TimeSpan.FromMinutes(10);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    static void MarkRestart()
-    {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(RestartStampPath)!);
-            File.WriteAllText(RestartStampPath, DateTime.UtcNow.ToString("o"));
-        }
-        catch
-        {
-            // Failing to stamp must not block recovery.
-        }
     }
 
     static void SaveConfig(Config c)

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Windows.Graphics.Imaging;
 using Core = PresenceLock.Core;
@@ -80,6 +81,35 @@ static class PolicyBridge
 
     internal static bool IsHandleInvalid(Exception ex) => IsHandleInvalid(ex.HResult, ex.Message);
 
+    /// The complete, core-owned gate for "should we attempt (re)acquisition" (rfc-core-brain.md
+    /// R2-4/R2-15): true exactly while `Policy.status` is `AcquiringCamera` or `Recovering` —
+    /// first-init retries only, per the Status priority table, which makes this test
+    /// structurally incapable of gating a post-success in-process re-init. Shared by the retry
+    /// timer's `Tick` guard and both `KickAcquisitionIfNeeded` call sites, replacing the legacy
+    /// shell-local `!paused && !sessionLocked` booleans with one source of truth. Pure and
+    /// factored out here (rather than inlined three times as `.Tag ==` comparisons) specifically
+    /// so it is independently unit-tested against every `Status` case.
+    internal static bool IsAcquiringOrRecovering(Core.Status status) =>
+        status.Tag == Core.Status.Tags.AcquiringCamera || status.Tag == Core.Status.Tags.Recovering;
+
+    /// Status → tray/status-text mapping (rfc-core-brain.md, slice 8b deliverable: "Status →
+    /// tray/log mapping table implemented as a single function"). `lastObservationDark` is the
+    /// shell's own current-sample dark-vs-no-frame knowledge (Core's `Status.NoSignal` does not
+    /// distinguish the two — see "Notes" — the shell already computed the distinction one line
+    /// before constructing the `Observation`). Pure and tested independently of `WatcherContext`.
+    internal static string StatusText(Core.Status status, bool lastObservationDark) => status.Tag switch
+    {
+        Core.Status.Tags.Watching => "Watching",
+        Core.Status.Tags.NoSignal => lastObservationDark
+            ? "Camera dark/blocked — not locking"
+            : "No camera frames — not locking",
+        Core.Status.Tags.SessionLocked => "Session locked — watching paused",
+        Core.Status.Tags.Paused => "Paused — camera kept open",
+        Core.Status.Tags.AcquiringCamera => "Starting…",
+        Core.Status.Tags.Recovering => "Camera unavailable — retrying",
+        _ => throw new UnreachableException(),
+    };
+
     /// Shared event-construction function (rfc-core-brain.md slice 8a: "Factor each call
     /// site's event construction into a small named function... reused unchanged by 8a's
     /// `ShadowAdvance` and 8b's `Advance`"). The shell already computes `haveFrame`/`dark`/
@@ -137,13 +167,10 @@ static class PolicyBridge
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "PresenceLock", "restart-stamps.json");
 
-    /// Reads the RFC's new wall-clock stamps file (rfc-core-brain.md, "Restart stamps") if
-    /// present, else returns empty stamps — any read/parse error also yields empty, since a
-    /// parse failure must never block recovery. Nothing writes this file yet: that's 8b/8c,
-    /// once `Action.Restart` is actually executed and its cooldown persisted. Read-only here,
-    /// so the shadow core's own `Policy.start` has a real (currently always-empty) input
-    /// rather than a hand-rolled literal, and the same reader is what 8b's real `Advance`
-    /// reuses unchanged.
+    /// Reads the wall-clock stamps file (rfc-core-brain.md, "Restart stamps") if present, else
+    /// returns empty stamps — any read/parse error also yields empty, since a parse failure
+    /// must never block recovery. Feeds `Policy.start` at every startup; the counterpart writer
+    /// is `SaveRestartStamps`, called only from `RestartProcess()` immediately before spawn.
     internal static Core.RestartStamps LoadRestartStamps()
     {
         try
@@ -152,7 +179,7 @@ static class PolicyBridge
             {
                 var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(StampsPath));
                 if (dto is not null)
-                    return new Core.RestartStamps(wedgeAt: ToNullable(dto.WedgeAt), reevalAt: ToNullable(dto.ReevalAt));
+                    return new Core.RestartStamps(wedgeAt: dto.WedgeAt, reevalAt: dto.ReevalAt);
             }
         }
         catch (Exception ex)
@@ -162,11 +189,56 @@ static class PolicyBridge
         return EmptyRestartStamps;
     }
 
-    static Nullable<long> ToNullable(long? v) => v.HasValue ? new Nullable<long>(v.Value) : new Nullable<long>();
+    /// Writer counterpart to `LoadRestartStamps` (rfc-core-brain.md, "Restart stamps" /
+    /// R1-29): persists both stamp fields verbatim (Policy.step itself only ever bumps the one
+    /// matching the reason it fired, so a plain round-trip here can't poison the other reason's
+    /// cooldown) plus the paused flag, in one JSON write. Called only from `RestartProcess()`,
+    /// immediately before spawn — never on any other path (R2-11's pinned lifecycle: the flag
+    /// is written only here and consumed-and-cleared by `ConsumePersistedPausedFlag`). A write
+    /// failure must not block the restart itself, so it is caught and logged, not thrown.
+    internal static void SaveRestartStamps(Core.RestartStamps stamps, bool paused)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(StampsPath)!);
+            var dto = new RestartStampsDto { WedgeAt = stamps.WedgeAt, ReevalAt = stamps.ReevalAt, Paused = paused };
+            File.WriteAllText(StampsPath, JsonSerializer.Serialize(dto, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"restart stamps save failed: {ex.Message}");
+        }
+    }
+
+    /// Paused-flag consume-and-clear (rfc-core-brain.md R2-11, pinned lifecycle): reads the
+    /// persisted flag; if set, immediately rewrites the file with it cleared (stamps untouched)
+    /// and returns true so the caller feeds `Event.Paused` through `Advance` right after
+    /// `Policy.start`. Returns false — and touches nothing on disk — when absent/false/unparseable,
+    /// so a normal launch or a tray Exit never inherits a stale pause, and a parse failure
+    /// never blocks startup. Called exactly once, from `WatcherContext`'s constructor.
+    internal static bool ConsumePersistedPausedFlag()
+    {
+        try
+        {
+            if (!File.Exists(StampsPath)) return false;
+            var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(StampsPath));
+            if (dto is null || !dto.Paused) return false;
+
+            var cleared = new RestartStampsDto { WedgeAt = dto.WedgeAt, ReevalAt = dto.ReevalAt, Paused = false };
+            File.WriteAllText(StampsPath, JsonSerializer.Serialize(cleared, new JsonSerializerOptions { WriteIndented = true }));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"paused-flag consume failed: {ex.Message}");
+            return false;
+        }
+    }
 
     sealed class RestartStampsDto
     {
         public long? WedgeAt { get; init; }
         public long? ReevalAt { get; init; }
+        public bool Paused { get; init; }
     }
 }

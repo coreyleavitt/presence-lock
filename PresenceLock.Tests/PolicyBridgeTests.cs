@@ -232,15 +232,181 @@ public class LargestFaceBoxNormalizedTests
     }
 }
 
+/// Shell-side status→text mapping (rfc-core-brain.md, slice 8b deliverable). Pure and tested
+/// independently of WatcherContext per every Status case.
+public class StatusTextTests
+{
+    [Fact]
+    public void NoSignal_dark_uses_dark_blocked_text()
+    {
+        Assert.Equal("Camera dark/blocked — not locking", PolicyBridge.StatusText(Core.Status.NoSignal, lastObservationDark: true));
+    }
+
+    [Fact]
+    public void NoSignal_no_frame_uses_no_frames_text()
+    {
+        Assert.Equal("No camera frames — not locking", PolicyBridge.StatusText(Core.Status.NoSignal, lastObservationDark: false));
+    }
+
+    [Fact]
+    public void Watching_maps_to_Watching()
+    {
+        Assert.Equal("Watching", PolicyBridge.StatusText(Core.Status.Watching, lastObservationDark: false));
+    }
+
+    [Fact]
+    public void SessionLocked_maps_to_the_expected_text()
+    {
+        Assert.Equal("Session locked — watching paused", PolicyBridge.StatusText(Core.Status.SessionLocked, lastObservationDark: false));
+    }
+
+    [Fact]
+    public void Paused_maps_to_the_expected_text()
+    {
+        Assert.Equal("Paused — camera kept open", PolicyBridge.StatusText(Core.Status.Paused, lastObservationDark: false));
+    }
+
+    [Fact]
+    public void AcquiringCamera_maps_to_Starting()
+    {
+        Assert.Equal("Starting…", PolicyBridge.StatusText(Core.Status.AcquiringCamera, lastObservationDark: false));
+    }
+
+    [Fact]
+    public void Recovering_maps_to_retrying_text()
+    {
+        Assert.Equal("Camera unavailable — retrying", PolicyBridge.StatusText(Core.Status.Recovering, lastObservationDark: false));
+    }
+}
+
+/// The complete, core-owned retry/kick gate (rfc-core-brain.md R2-4/R2-15): true exactly for
+/// AcquiringCamera/Recovering, the pre-first-success-only statuses.
+public class IsAcquiringOrRecoveringTests
+{
+    [Fact]
+    public void AcquiringCamera_and_Recovering_are_true()
+    {
+        Assert.True(PolicyBridge.IsAcquiringOrRecovering(Core.Status.AcquiringCamera));
+        Assert.True(PolicyBridge.IsAcquiringOrRecovering(Core.Status.Recovering));
+    }
+
+    [Fact]
+    public void Every_other_status_is_false()
+    {
+        Assert.False(PolicyBridge.IsAcquiringOrRecovering(Core.Status.Watching));
+        Assert.False(PolicyBridge.IsAcquiringOrRecovering(Core.Status.NoSignal));
+        Assert.False(PolicyBridge.IsAcquiringOrRecovering(Core.Status.SessionLocked));
+        Assert.False(PolicyBridge.IsAcquiringOrRecovering(Core.Status.Paused));
+    }
+}
+
 public class LoadRestartStampsTests
 {
     [Fact]
     public void Missing_file_yields_empty_stamps()
     {
         var stamps = PolicyBridge.LoadRestartStamps();
-        // Nothing writes the new stamps file yet in shadow mode (8b/8c wire persistence) —
-        // this call must never throw and must default to empty when the file is absent.
+        // This call must never throw and must default to empty when the file is absent.
         Assert.False(stamps.WedgeAt.HasValue);
         Assert.False(stamps.ReevalAt.HasValue);
+    }
+}
+
+/// Stamps-file writer round-trip (rfc-core-brain.md, "Restart stamps" / R1-29) and the
+/// paused-flag consume-and-clear file semantics (R2-11's pinned lifecycle). These tests read
+/// and write the real per-user stamps file (there is no seam to inject a path), matching
+/// LoadRestartStampsTests' existing precedent — each test restores the file to "absent" in a
+/// finally block so it does not leak state into other tests in this collection.
+public class RestartStampsPersistenceTests
+{
+    static readonly string StampsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PresenceLock", "restart-stamps.json");
+
+    [Fact]
+    public void Saved_stamps_round_trip_through_LoadRestartStamps()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        try
+        {
+            var stamps = new Core.RestartStamps(wedgeAt: 1_700_000_000_000, reevalAt: 1_700_000_500_000);
+
+            PolicyBridge.SaveRestartStamps(stamps, paused: false);
+            var loaded = PolicyBridge.LoadRestartStamps();
+
+            Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
+            Assert.Equal(1_700_000_500_000, loaded.ReevalAt);
+        }
+        finally
+        {
+            if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        }
+    }
+
+    [Fact]
+    public void Saved_stamps_with_only_one_reason_set_round_trip_the_other_as_absent()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        try
+        {
+            var stamps = new Core.RestartStamps(wedgeAt: 1_700_000_000_000, reevalAt: null);
+
+            PolicyBridge.SaveRestartStamps(stamps, paused: false);
+            var loaded = PolicyBridge.LoadRestartStamps();
+
+            Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
+            Assert.False(loaded.ReevalAt.HasValue);
+        }
+        finally
+        {
+            if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        }
+    }
+
+    [Fact]
+    public void Consume_returns_false_and_writes_nothing_when_no_file_exists()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        Assert.False(PolicyBridge.ConsumePersistedPausedFlag());
+        Assert.False(File.Exists(StampsPath));
+    }
+
+    [Fact]
+    public void Consume_returns_false_when_the_persisted_flag_is_not_set()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        try
+        {
+            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null), paused: false);
+            Assert.False(PolicyBridge.ConsumePersistedPausedFlag());
+        }
+        finally
+        {
+            if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        }
+    }
+
+    [Fact]
+    public void Consume_returns_true_once_and_clears_the_flag_while_preserving_stamps()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        try
+        {
+            var stamps = new Core.RestartStamps(wedgeAt: 42, reevalAt: 43);
+            PolicyBridge.SaveRestartStamps(stamps, paused: true);
+
+            Assert.True(PolicyBridge.ConsumePersistedPausedFlag());
+            // Consumed-and-cleared: a second call sees the flag already cleared.
+            Assert.False(PolicyBridge.ConsumePersistedPausedFlag());
+
+            // Stamps themselves survive the clear untouched.
+            var loaded = PolicyBridge.LoadRestartStamps();
+            Assert.Equal(42L, loaded.WedgeAt);
+            Assert.Equal(43L, loaded.ReevalAt);
+        }
+        finally
+        {
+            if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        }
     }
 }
