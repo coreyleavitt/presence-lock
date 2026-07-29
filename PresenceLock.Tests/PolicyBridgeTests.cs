@@ -410,3 +410,57 @@ public class RestartStampsPersistenceTests
         }
     }
 }
+
+/// Migration cleanup (rfc-core-brain.md, "Restart stamps" / R2-34): the superseded
+/// last-restart.txt is deleted the first time SaveRestartStamps runs on an upgraded build.
+/// Same real-filesystem precedent as RestartStampsPersistenceTests — no seam to inject a path.
+public class LegacyRestartStampCleanupTests
+{
+    static readonly string StampsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PresenceLock", "restart-stamps.json");
+
+    static readonly string LegacyPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PresenceLock", "last-restart.txt");
+
+    [Fact]
+    public void SaveRestartStamps_deletes_a_pre_existing_legacy_stamp_file()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(LegacyPath)!);
+        File.WriteAllText(LegacyPath, DateTime.UtcNow.ToString("o"));
+        try
+        {
+            Assert.True(File.Exists(LegacyPath));
+
+            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null), paused: false);
+
+            Assert.False(File.Exists(LegacyPath));
+        }
+        finally
+        {
+            if (File.Exists(StampsPath)) File.Delete(StampsPath);
+            if (File.Exists(LegacyPath)) File.Delete(LegacyPath);
+        }
+    }
+
+    [Fact]
+    public void SaveRestartStamps_is_silent_when_no_legacy_stamp_file_exists()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        if (File.Exists(LegacyPath)) File.Delete(LegacyPath);
+        try
+        {
+            // Absence is the steady state after the first upgraded run — must never throw and
+            // must not conjure the legacy file back into existence.
+            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null), paused: false);
+
+            Assert.False(File.Exists(LegacyPath));
+        }
+        finally
+        {
+            if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        }
+    }
+}

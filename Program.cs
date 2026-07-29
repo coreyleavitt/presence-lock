@@ -107,15 +107,6 @@ static class Log
 
 sealed class WatcherContext : ApplicationContext
 {
-    // In-process re-init machinery, retained verbatim pending slice 8c (rfc-core-brain.md,
-    // slice 8c: "isolated as its own step so a slice-9 regression is attributable to this
-    // specific, higher-risk change rather than conflated with the parity-preserving cutover").
-    // Neither the constant below nor RestartWatchingAsync/TeardownCameraAsync has any call
-    // site left after this slice — the core's Action.Restart is the only path to a process
-    // restart now, and it never reaches these. Left in place, unreferenced, for 8c to delete
-    // as its own isolated diff.
-    const int CameraReinitSamples = 40;
-
     Config cfg;
     // The real decision core (rfc-core-brain.md, slice 8b cutover): the sole decision-maker.
     // `Advance` is the only place `state` is reassigned. `policyConfig` is rebuilt whenever
@@ -292,30 +283,6 @@ sealed class WatcherContext : ApplicationContext
         {
             starting = false;
         }
-    }
-
-    // In-process re-init machinery, retained verbatim pending slice 8c (see the class-level
-    // comment on CameraReinitSamples). No call site reaches this method after the 8b cutover —
-    // the core's Action.Restart, executed via RestartProcess(), is the only recovery path now.
-    async Task RestartWatchingAsync()
-    {
-        sampleTimer.Stop();
-        await TeardownCameraAsync();
-        await Task.Delay(1500);
-        if (PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state))) await StartWatchingAsync();
-    }
-
-    // Stop the frame reader gracefully before disposing; hard-disposing an
-    // actively streaming reader is another suspected wedge trigger.
-    async Task TeardownCameraAsync()
-    {
-        var r = reader;
-        if (r is not null)
-        {
-            try { await r.StopAsync(); }
-            catch (Exception ex) { Log.Write($"reader stop: {ex.Message}"); }
-        }
-        TeardownCamera();
     }
 
     async Task InitCameraAsync()

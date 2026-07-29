@@ -167,6 +167,13 @@ static class PolicyBridge
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "PresenceLock", "restart-stamps.json");
 
+    /// The file this JSON stamps file supersedes (rfc-core-brain.md, "Restart stamps" / R2-34):
+    /// a plain-text single wall-clock timestamp, replaced by `StampsPath`'s per-`RestartReason`
+    /// JSON. Deleted the first time `SaveRestartStamps` runs on an upgraded build — see there.
+    static readonly string LegacyRestartStampPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PresenceLock", "last-restart.txt");
+
     /// Reads the wall-clock stamps file (rfc-core-brain.md, "Restart stamps") if present, else
     /// returns empty stamps — any read/parse error also yields empty, since a parse failure
     /// must never block recovery. Feeds `Policy.start` at every startup; the counterpart writer
@@ -207,6 +214,21 @@ static class PolicyBridge
         catch (Exception ex)
         {
             Log.Write($"restart stamps save failed: {ex.Message}");
+        }
+
+        // Migration cleanup (rfc-core-brain.md, "Restart stamps" / R2-34): last-restart.txt is
+        // superseded by the stamps file above; delete it here, the first time this method runs
+        // on an upgraded build. File.Delete is already a silent no-op when the path is absent
+        // (true for every call after the first), so no separate "have we done this yet" state
+        // is needed. A cleanup failure must never block the restart this method exists to
+        // support, so it is caught and logged, not thrown.
+        try
+        {
+            File.Delete(LegacyRestartStampPath);
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"legacy restart stamp cleanup failed: {ex.Message}");
         }
     }
 
