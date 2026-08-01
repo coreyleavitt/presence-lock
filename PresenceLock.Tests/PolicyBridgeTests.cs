@@ -1,5 +1,6 @@
 using Core = PresenceLock.Core;
 using Windows.Graphics.Imaging;
+using EnclosurePanel = Windows.Devices.Enumeration.Panel;
 using Xunit;
 
 namespace PresenceLock.Tests;
@@ -89,6 +90,7 @@ public class BuildPolicyConfigTests
             ReevaluateCooldownMs = 600000,
             RecoveryFailureThreshold = 3,
             RecoveryCooldownMs = 600000,
+            UpgradeCooldownMs = 600000,
         };
 
         var policy = PolicyBridge.BuildPolicyConfig(cfg);
@@ -101,6 +103,7 @@ public class BuildPolicyConfigTests
         Assert.Equal(600000, policy.ReevaluateCooldownMs);
         Assert.Equal(3, policy.RecoveryFailureThreshold);
         Assert.Equal(600000, policy.RecoveryCooldownMs);
+        Assert.Equal(600000, policy.UpgradeCooldownMs);
     }
 
     [Fact]
@@ -116,17 +119,19 @@ public class BuildPolicyConfigTests
         Assert.Equal(600000, policy.ReevaluateCooldownMs);
         Assert.Equal(3, policy.RecoveryFailureThreshold);
         Assert.Equal(600000, policy.RecoveryCooldownMs);
+        Assert.Equal(600000, policy.UpgradeCooldownMs);
     }
 
     [Theory]
-    [InlineData(0.0, 10.0, 10.0, 10000L, 20000L, 600000L, 3, 600000L)]   // AwayThresholdSeconds <= 0
-    [InlineData(5.0, 10.0, 10.0, 0L, 20000L, 600000L, 3, 600000L)]       // NoSignalReportAfterMs <= 0
-    [InlineData(5.0, 10.0, 10.0, 10000L, 20000L, 600000L, 0, 600000L)]   // RecoveryFailureThreshold < 1
-    [InlineData(5.0, 10.0, 10.0, 20000L, 10000L, 600000L, 3, 600000L)]   // ReevaluateAfterMs < NoSignalReportAfterMs
+    [InlineData(0.0, 10.0, 10.0, 10000L, 20000L, 600000L, 3, 600000L, 600000L)]   // AwayThresholdSeconds <= 0
+    [InlineData(5.0, 10.0, 10.0, 0L, 20000L, 600000L, 3, 600000L, 600000L)]       // NoSignalReportAfterMs <= 0
+    [InlineData(5.0, 10.0, 10.0, 10000L, 20000L, 600000L, 0, 600000L, 600000L)]   // RecoveryFailureThreshold < 1
+    [InlineData(5.0, 10.0, 10.0, 20000L, 10000L, 600000L, 3, 600000L, 600000L)]   // ReevaluateAfterMs < NoSignalReportAfterMs
+    [InlineData(5.0, 10.0, 10.0, 10000L, 20000L, 600000L, 3, 600000L, 0L)]        // UpgradeCooldownMs <= 0
     public void Any_single_invalid_field_falls_back_to_the_full_default_set_never_a_partial_mix(
         double awaySeconds, double idleSeconds, double graceSeconds,
         long noSignalMs, long reevaluateAfterMs, long reevaluateCooldownMs,
-        int recoveryThreshold, long recoveryCooldownMs)
+        int recoveryThreshold, long recoveryCooldownMs, long upgradeCooldownMs)
     {
         var cfg = new Config
         {
@@ -138,6 +143,7 @@ public class BuildPolicyConfigTests
             ReevaluateCooldownMs = reevaluateCooldownMs,
             RecoveryFailureThreshold = recoveryThreshold,
             RecoveryCooldownMs = recoveryCooldownMs,
+            UpgradeCooldownMs = upgradeCooldownMs,
         };
 
         var policy = PolicyBridge.BuildPolicyConfig(cfg);
@@ -151,6 +157,7 @@ public class BuildPolicyConfigTests
         Assert.Equal(expectedDefaults.ReevaluateCooldownMs, policy.ReevaluateCooldownMs);
         Assert.Equal(expectedDefaults.RecoveryFailureThreshold, policy.RecoveryFailureThreshold);
         Assert.Equal(expectedDefaults.RecoveryCooldownMs, policy.RecoveryCooldownMs);
+        Assert.Equal(expectedDefaults.UpgradeCooldownMs, policy.UpgradeCooldownMs);
     }
 
     [Fact]
@@ -300,6 +307,121 @@ public class IsAcquiringOrRecoveringTests
     }
 }
 
+/// The camera preference ranking (rfc-core-brain.md addendum 2026-08-01, slice 10:
+/// camera-arrival upgrade), factored out of InitCameraAsync's original inline selection so
+/// startup selection and the arrival-triggered device watcher share one implementation. These
+/// tests are the proof that the extraction is behavior-preserving: every case here is exactly
+/// what InitCameraAsync computed inline before this slice.
+public class SelectPreferredCameraTests
+{
+    [Fact]
+    public void No_candidates_yields_null()
+    {
+        Assert.Null(PolicyBridge.SelectPreferredCamera(Array.Empty<PolicyBridge.CameraCandidate>(), nameFilter: ""));
+    }
+
+    [Fact]
+    public void A_non_blank_user_filter_match_wins_outright_over_panel_ranking()
+    {
+        // The filter match is a built-in-front camera and would lose to the external camera on
+        // panel rank alone -- an explicit user filter must still win.
+        var candidates = new[]
+        {
+            new PolicyBridge.CameraCandidate("ext-1", "Logitech BRIO", EnclosurePanel.Unknown),
+            new PolicyBridge.CameraCandidate("front-1", "Surface Camera Front", EnclosurePanel.Front),
+        };
+
+        var chosen = PolicyBridge.SelectPreferredCamera(candidates, nameFilter: "Surface");
+
+        Assert.Equal("front-1", chosen);
+    }
+
+    [Fact]
+    public void Filter_match_is_case_insensitive()
+    {
+        var candidates = new[] { new PolicyBridge.CameraCandidate("id-1", "LifeCam HD-3000", EnclosurePanel.Unknown) };
+
+        Assert.Equal("id-1", PolicyBridge.SelectPreferredCamera(candidates, nameFilter: "lifecam"));
+    }
+
+    [Fact]
+    public void Filter_matches_the_first_candidate_in_input_order()
+    {
+        var candidates = new[]
+        {
+            new PolicyBridge.CameraCandidate("first", "USB Camera", EnclosurePanel.Unknown),
+            new PolicyBridge.CameraCandidate("second", "USB Camera", EnclosurePanel.Unknown),
+        };
+
+        Assert.Equal("first", PolicyBridge.SelectPreferredCamera(candidates, nameFilter: "USB"));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData(null)]
+    public void A_blank_or_null_filter_falls_straight_through_to_panel_ranking(string? nameFilter)
+    {
+        var candidates = new[]
+        {
+            new PolicyBridge.CameraCandidate("front-1", "Surface Camera Front", EnclosurePanel.Front),
+            new PolicyBridge.CameraCandidate("ext-1", "External USB Camera", EnclosurePanel.Unknown),
+        };
+
+        Assert.Equal("ext-1", PolicyBridge.SelectPreferredCamera(candidates, nameFilter!));
+    }
+
+    [Fact]
+    public void A_filter_that_matches_nothing_falls_through_to_panel_ranking()
+    {
+        var candidates = new[]
+        {
+            new PolicyBridge.CameraCandidate("front-1", "Surface Camera Front", EnclosurePanel.Front),
+            new PolicyBridge.CameraCandidate("ext-1", "External USB Camera", EnclosurePanel.Unknown),
+        };
+
+        Assert.Equal("ext-1", PolicyBridge.SelectPreferredCamera(candidates, nameFilter: "Nonexistent"));
+    }
+
+    [Fact]
+    public void No_enclosure_location_external_over_built_in_front()
+    {
+        // The exact ordering rfc-core-brain.md's original SelectionRank implemented: no
+        // enclosure location at all (external USB webcams) ranks above Front.
+        var candidates = new[]
+        {
+            new PolicyBridge.CameraCandidate("front-1", "Built-in Front", EnclosurePanel.Front),
+            new PolicyBridge.CameraCandidate("ext-1", "External Webcam", EnclosurePanel.Unknown),
+        };
+
+        Assert.Equal("ext-1", PolicyBridge.SelectPreferredCamera(candidates, nameFilter: ""));
+    }
+
+    [Fact]
+    public void Front_ranks_above_any_other_known_panel_location()
+    {
+        var candidates = new[]
+        {
+            new PolicyBridge.CameraCandidate("back-1", "Built-in Back", EnclosurePanel.Back),
+            new PolicyBridge.CameraCandidate("front-1", "Built-in Front", EnclosurePanel.Front),
+        };
+
+        Assert.Equal("front-1", PolicyBridge.SelectPreferredCamera(candidates, nameFilter: ""));
+    }
+
+    [Fact]
+    public void Ties_in_panel_rank_prefer_the_first_candidate_in_input_order()
+    {
+        var candidates = new[]
+        {
+            new PolicyBridge.CameraCandidate("ext-1", "External Webcam A", EnclosurePanel.Unknown),
+            new PolicyBridge.CameraCandidate("ext-2", "External Webcam B", EnclosurePanel.Unknown),
+        };
+
+        Assert.Equal("ext-1", PolicyBridge.SelectPreferredCamera(candidates, nameFilter: ""));
+    }
+}
+
 public class LoadRestartStampsTests
 {
     [Fact]
@@ -309,6 +431,7 @@ public class LoadRestartStampsTests
         // This call must never throw and must default to empty when the file is absent.
         Assert.False(stamps.WedgeAt.HasValue);
         Assert.False(stamps.ReevalAt.HasValue);
+        Assert.False(stamps.UpgradeAt.HasValue);
     }
 }
 
@@ -329,13 +452,15 @@ public class RestartStampsPersistenceTests
         if (File.Exists(StampsPath)) File.Delete(StampsPath);
         try
         {
-            var stamps = new Core.RestartStamps(wedgeAt: 1_700_000_000_000, reevalAt: 1_700_000_500_000);
+            var stamps = new Core.RestartStamps(
+                wedgeAt: 1_700_000_000_000, reevalAt: 1_700_000_500_000, upgradeAt: 1_700_000_800_000);
 
             PolicyBridge.SaveRestartStamps(stamps, paused: false);
             var loaded = PolicyBridge.LoadRestartStamps();
 
             Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
             Assert.Equal(1_700_000_500_000, loaded.ReevalAt);
+            Assert.Equal(1_700_000_800_000, loaded.UpgradeAt);
         }
         finally
         {
@@ -344,18 +469,44 @@ public class RestartStampsPersistenceTests
     }
 
     [Fact]
-    public void Saved_stamps_with_only_one_reason_set_round_trip_the_other_as_absent()
+    public void Saved_stamps_with_only_one_reason_set_round_trip_the_others_as_absent()
     {
         if (File.Exists(StampsPath)) File.Delete(StampsPath);
         try
         {
-            var stamps = new Core.RestartStamps(wedgeAt: 1_700_000_000_000, reevalAt: null);
+            var stamps = new Core.RestartStamps(wedgeAt: 1_700_000_000_000, reevalAt: null, upgradeAt: null);
 
             PolicyBridge.SaveRestartStamps(stamps, paused: false);
             var loaded = PolicyBridge.LoadRestartStamps();
 
             Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
             Assert.False(loaded.ReevalAt.HasValue);
+            Assert.False(loaded.UpgradeAt.HasValue);
+        }
+        finally
+        {
+            if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        }
+    }
+
+    /// Back-compat (rfc-core-brain.md addendum 2026-08-01, slice 10): a stamps file written by
+    /// a pre-slice-10 build has only WedgeAt/ReevalAt/Paused keys. The third field must load as
+    /// null rather than fail, exactly like WedgeAt/ReevalAt themselves behaved before either had
+    /// ever fired (R2-40's "confirming named Nullable fields remain the right shape at three").
+    [Fact]
+    public void An_old_two_field_stamps_file_loads_with_a_null_UpgradeAt()
+    {
+        if (File.Exists(StampsPath)) File.Delete(StampsPath);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(StampsPath)!);
+            File.WriteAllText(StampsPath, """{"WedgeAt":1700000000000,"ReevalAt":null,"Paused":false}""");
+
+            var loaded = PolicyBridge.LoadRestartStamps();
+
+            Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
+            Assert.False(loaded.ReevalAt.HasValue);
+            Assert.False(loaded.UpgradeAt.HasValue);
         }
         finally
         {
@@ -377,7 +528,7 @@ public class RestartStampsPersistenceTests
         if (File.Exists(StampsPath)) File.Delete(StampsPath);
         try
         {
-            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null), paused: false);
+            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false);
             Assert.False(PolicyBridge.ConsumePersistedPausedFlag());
         }
         finally
@@ -392,7 +543,7 @@ public class RestartStampsPersistenceTests
         if (File.Exists(StampsPath)) File.Delete(StampsPath);
         try
         {
-            var stamps = new Core.RestartStamps(wedgeAt: 42, reevalAt: 43);
+            var stamps = new Core.RestartStamps(wedgeAt: 42, reevalAt: 43, upgradeAt: 44);
             PolicyBridge.SaveRestartStamps(stamps, paused: true);
 
             Assert.True(PolicyBridge.ConsumePersistedPausedFlag());
@@ -403,6 +554,7 @@ public class RestartStampsPersistenceTests
             var loaded = PolicyBridge.LoadRestartStamps();
             Assert.Equal(42L, loaded.WedgeAt);
             Assert.Equal(43L, loaded.ReevalAt);
+            Assert.Equal(44L, loaded.UpgradeAt);
         }
         finally
         {
@@ -434,7 +586,7 @@ public class LegacyRestartStampCleanupTests
         {
             Assert.True(File.Exists(LegacyPath));
 
-            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null), paused: false);
+            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false);
 
             Assert.False(File.Exists(LegacyPath));
         }
@@ -454,7 +606,7 @@ public class LegacyRestartStampCleanupTests
         {
             // Absence is the steady state after the first upgraded run — must never throw and
             // must not conjure the legacy file back into existence.
-            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null), paused: false);
+            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false);
 
             Assert.False(File.Exists(LegacyPath));
         }

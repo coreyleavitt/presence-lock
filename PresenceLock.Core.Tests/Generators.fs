@@ -32,6 +32,7 @@ let policyConfigGen : Gen<PolicyConfig> =
         let! reevaluateCooldownMs = Gen.choose (1, 3_600_000)
         let! recoveryFailureThreshold = Gen.choose (1, 10)
         let! recoveryCooldownMs = Gen.choose (1, 3_600_000)
+        let! upgradeCooldownMs = Gen.choose (1, 3_600_000)
         return
             { AwayThresholdMs = int64 awayThresholdMs
               InputIdleRequiredMs = int64 inputIdleRequiredMs
@@ -40,7 +41,8 @@ let policyConfigGen : Gen<PolicyConfig> =
               ReevaluateAfterMs = int64 noSignalReportAfterMs + int64 reevaluateExtraMs
               ReevaluateCooldownMs = int64 reevaluateCooldownMs
               RecoveryFailureThreshold = recoveryFailureThreshold
-              RecoveryCooldownMs = int64 recoveryCooldownMs }
+              RecoveryCooldownMs = int64 recoveryCooldownMs
+              UpgradeCooldownMs = int64 upgradeCooldownMs }
     }
 
 let observationGen : Gen<Observation> =
@@ -63,7 +65,8 @@ let eventGen : Gen<Event> =
           Gen.constant Event.SessionLocked
           Gen.constant Event.SessionUnlocked
           Gen.constant Event.Paused
-          Gen.constant Event.Resumed ]
+          Gen.constant Event.Resumed
+          Gen.constant Event.BetterCameraAvailable ]
 
 /// A normalized face box within the unit frame (rfc-core-brain.handoff.md, "Burn-in incident
 /// 2026-07-28"): width/height are strictly positive — a real detector never reports a
@@ -96,7 +99,8 @@ let restartStampsGen : Gen<RestartStamps> =
     gen {
         let! wedgeAt = nullableWallClockGen
         let! reevalAt = nullableWallClockGen
-        return { WedgeAt = wedgeAt; ReevalAt = reevalAt }
+        let! upgradeAt = nullableWallClockGen
+        return { WedgeAt = wedgeAt; ReevalAt = reevalAt; UpgradeAt = upgradeAt }
     }
 
 /// Registered with FsCheck.Xunit via `[<Properties(Arbitrary = [| typeof<Generators> |])>]` on

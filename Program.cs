@@ -44,15 +44,19 @@ sealed class Config
     // Mean 8-bit luminance below this is a blocked/dark camera, not an empty room.
     public double DarkFrameMeanThreshold { get; init; } = 6.0;
 
-    // Five PolicyConfig-mapped fields (rfc-core-brain.md, "Config" mapping table). Existing
-    // on-disk files simply lack these keys and get these defaults, exactly like every other
-    // absent field today — the schema stays backward-compatible. Consumed only by
-    // PolicyBridge.BuildPolicyConfig; no shell decision code reads them directly.
+    // Six PolicyConfig-mapped fields (rfc-core-brain.md, "Config" mapping table, extended by
+    // the 2026-08-01 addendum's UpgradeCooldownMs). Existing on-disk files simply lack these
+    // keys and get these defaults, exactly like every other absent field today — the schema
+    // stays backward-compatible. Consumed only by PolicyBridge.BuildPolicyConfig; no shell
+    // decision code reads them directly.
     public long NoSignalReportAfterMs { get; init; } = 10000;
     public long ReevaluateAfterMs { get; init; } = 20000;
     public long ReevaluateCooldownMs { get; init; } = 600000;
     public int RecoveryFailureThreshold { get; init; } = 3;
     public long RecoveryCooldownMs { get; init; } = 600000;
+    // RFC addendum 2026-08-01, slice 10 (camera-arrival upgrade): minimum gap between
+    // CameraUpgrade restarts. No Settings UI control, same as the other five.
+    public long UpgradeCooldownMs { get; init; } = 600000;
 
     public static Config Load()
     {
@@ -126,11 +130,22 @@ sealed class WatcherContext : ApplicationContext
     readonly ToolStripMenuItem pauseItem;
     readonly WinFormsTimer sampleTimer;
     readonly WinFormsTimer retryTimer;
+    // Camera-arrival upgrade (rfc-core-brain.md addendum 2026-08-01, slice 10): debounces a
+    // burst of DeviceWatcher.Added events (a dock enumerates several devices over seconds)
+    // into a single would-pick-now check, restarted on every Added event seen after
+    // EnumerationCompleted.
+    readonly WinFormsTimer deviceSettleTimer;
+    readonly Windows.Devices.Enumeration.DeviceWatcher deviceWatcher;
+    bool deviceEnumerationCompleted;
     readonly SynchronizationContext ui;
 
     FaceDetector? detector;
     MediaCapture? capture;
     MediaFrameReader? reader;
+    // The in-use camera's MediaFrameSourceInfo.Id (rfc-core-brain.md addendum 2026-08-01):
+    // set on every successful InitCameraAsync, cleared on teardown. CheckForBetterCamera
+    // compares this against SelectPreferredCamera's would-pick-now result.
+    string? activeCameraId;
 
     byte[]? lumaBuf;
     bool sampling;
@@ -218,6 +233,28 @@ sealed class WatcherContext : ApplicationContext
 
         SystemEvents.SessionSwitch += OnSessionSwitch;
 
+        // Camera-arrival upgrade (rfc-core-brain.md addendum 2026-08-01, slice 10): events
+        // marshaled to the UI thread — same precedent as OnSessionSwitch — since DeviceWatcher
+        // raises them from its own background thread. Ignore the initial-enumeration Added
+        // backfill (guarded by deviceEnumerationCompleted below); react only to a genuine
+        // post-enumeration arrival, debounced by deviceSettleTimer.
+        deviceSettleTimer = new WinFormsTimer { Interval = 5000 };
+        deviceSettleTimer.Tick += (_, _) =>
+        {
+            deviceSettleTimer.Stop();
+            CheckForBetterCamera();
+        };
+        deviceWatcher = Windows.Devices.Enumeration.DeviceInformation.CreateWatcher(
+            Windows.Devices.Enumeration.DeviceClass.VideoCapture);
+        deviceWatcher.Added += (_, _) => ui.Post(_ =>
+        {
+            if (!deviceEnumerationCompleted) return;
+            deviceSettleTimer.Stop();
+            deviceSettleTimer.Start();
+        }, null);
+        deviceWatcher.EnumerationCompleted += (_, _) => ui.Post(_ => deviceEnumerationCompleted = true, null);
+        deviceWatcher.Start();
+
         Log.Write($"started (threshold {cfg.AwayThresholdSeconds}s, sample {cfg.SampleIntervalMs}ms)");
 
         // Policy.start is called exactly once per process, before the first camera-acquisition
@@ -285,22 +322,39 @@ sealed class WatcherContext : ApplicationContext
         }
     }
 
-    async Task InitCameraAsync()
+    // Color-camera candidates as (Group, Info) pairs — the live WinRT handles selection needs
+    // to actually open a camera. Shared by InitCameraAsync's startup selection and the device-
+    // watcher's arrival-triggered settle check (rfc-core-brain.md addendum 2026-08-01, slice
+    // 10) so both enumerate identically; only the DTO projection below is what the pure
+    // ranking function sees.
+    static async Task<List<(MediaFrameSourceGroup Group, MediaFrameSourceInfo Info)>> ColorCameraCandidatesAsync()
     {
         var groups = await MediaFrameSourceGroup.FindAllAsync();
-        var candidates = groups
+        return groups
             .SelectMany(g => g.SourceInfos.Select(i => (Group: g, Info: i)))
             .Where(t => t.Info.SourceKind == MediaFrameSourceKind.Color)
             .ToList();
+    }
+
+    static List<PolicyBridge.CameraCandidate> ToCandidateDtos(
+        IEnumerable<(MediaFrameSourceGroup Group, MediaFrameSourceInfo Info)> candidates) =>
+        candidates
+            .Select(t => new PolicyBridge.CameraCandidate(t.Info.Id, t.Group.DisplayName, PanelOf(t.Info)))
+            .ToList();
+
+    async Task InitCameraAsync()
+    {
+        var candidates = await ColorCameraCandidatesAsync();
         if (candidates.Count == 0)
             throw new InvalidOperationException("no color camera found");
 
-        (MediaFrameSourceGroup Group, MediaFrameSourceInfo Info) chosen = default;
-        if (!string.IsNullOrWhiteSpace(cfg.CameraNameContains))
-            chosen = candidates.FirstOrDefault(t =>
-                t.Group.DisplayName.Contains(cfg.CameraNameContains, StringComparison.OrdinalIgnoreCase));
-        if (chosen.Group is null)
-            chosen = candidates.OrderBy(t => SelectionRank(t.Info)).First();
+        // Camera *selection* stays shell-side sensing (rfc-core-brain.md, "Notes"), but the
+        // ranking itself is the one pure, unit-tested function shared with the device-watcher
+        // settle check (rfc-core-brain.md addendum 2026-08-01, slice 10) — behavior-preserving
+        // refactor of what this method computed inline before this slice.
+        var chosenId = PolicyBridge.SelectPreferredCamera(ToCandidateDtos(candidates), cfg.CameraNameContains);
+        var chosen = candidates.First(t => t.Info.Id == chosenId);
+        activeCameraId = chosen.Info.Id;
 
         capture = new MediaCapture();
         capture.Failed += OnCaptureFailed;
@@ -324,14 +378,11 @@ sealed class WatcherContext : ApplicationContext
         Log.Write($"camera: {chosen.Group.DisplayName} (t{Environment.CurrentManagedThreadId})");
     }
 
-    // External USB webcams report no enclosure panel; prefer them over the
-    // built-in camera, which sees only the lid when the laptop is docked closed.
-    static int SelectionRank(MediaFrameSourceInfo info)
-    {
-        var loc = info.DeviceInformation?.EnclosureLocation;
-        if (loc is null || loc.Panel == EnclosurePanel.Unknown) return 0;
-        return loc.Panel == EnclosurePanel.Front ? 1 : 2;
-    }
+    // Normalizes "no enclosure location at all" (external USB webcams) to Unknown, matching
+    // PolicyBridge.PanelRank's treatment of Unknown as the best (external-preferred) rank —
+    // the panel half of what SelectPreferredCamera now ranks over.
+    static EnclosurePanel PanelOf(MediaFrameSourceInfo info) =>
+        info.DeviceInformation?.EnclosureLocation?.Panel ?? EnclosurePanel.Unknown;
 
     double MeanLuma(SoftwareBitmap gray)
     {
@@ -609,6 +660,8 @@ sealed class WatcherContext : ApplicationContext
                 $"(initFailStreak={snap.InitFailStreak}, noSignalForMs={snap.NoSignalForMs})",
             Core.RestartReason.Tags.CameraReevaluation =>
                 $"no usable signal — re-evaluating cameras (noSignalForMs={snap.NoSignalForMs})",
+            Core.RestartReason.Tags.CameraUpgrade =>
+                "preferred camera available — restarting process to switch cameras",
             _ => throw new UnreachableException(),
         };
         Log.Write(message);
@@ -651,6 +704,34 @@ sealed class WatcherContext : ApplicationContext
         reader = null;
         try { capture?.Dispose(); } catch (Exception ex) { Log.Write($"capture dispose: {ex.Message}"); }
         capture = null;
+        activeCameraId = null;
+    }
+
+    // Camera-arrival upgrade settle check (rfc-core-brain.md addendum 2026-08-01, slice 10):
+    // fires ~5s after the last DeviceWatcher.Added event in a burst. Compares the in-use
+    // camera against SelectPreferredCamera's would-pick-now result over a fresh enumeration —
+    // the identical ranking InitCameraAsync uses — and, on a mismatch, lets the core decide
+    // via Advance(Event.BetterCameraAvailable) rather than restarting unconditionally here.
+    // Only meaningful once a camera is actually in use: pre-acquisition, the retry loop
+    // already re-runs selection on every attempt.
+    async void CheckForBetterCamera()
+    {
+        if (reader is null) return;
+        try
+        {
+            var candidates = await ColorCameraCandidatesAsync();
+            if (candidates.Count == 0) return;
+            var wouldPickId = PolicyBridge.SelectPreferredCamera(ToCandidateDtos(candidates), cfg.CameraNameContains);
+            if (wouldPickId is not null && wouldPickId != activeCameraId)
+            {
+                Log.Write($"preferred camera changed (would-pick {wouldPickId} != in-use {activeCameraId}) — requesting upgrade restart");
+                if (Advance(Core.Event.BetterCameraAvailable)) return; // Action.Restart executed — process exiting
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"device-arrival camera check failed: {ex.Message}");
+        }
     }
 
     async void OpenSettings()
@@ -732,6 +813,7 @@ sealed class WatcherContext : ApplicationContext
     {
         sampleTimer.Stop();
         retryTimer.Stop();
+        deviceSettleTimer.Stop();
 
         // Policy.status(state) == Paused is a reliable proxy for the core's internal IsPaused
         // flag: Paused outranks every other Status in the priority table, so IsPaused true
@@ -743,7 +825,8 @@ sealed class WatcherContext : ApplicationContext
         // itself only ever bumps the one RestartStamps field matching the fired reason, so
         // snap.LastWedgeRestartAt/LastReevalRestartAt already carry that property — a plain
         // round-trip here can't poison the other reason's cooldown.
-        var stamps = new Core.RestartStamps(wedgeAt: snap.LastWedgeRestartAt, reevalAt: snap.LastReevalRestartAt);
+        var stamps = new Core.RestartStamps(
+            wedgeAt: snap.LastWedgeRestartAt, reevalAt: snap.LastReevalRestartAt, upgradeAt: snap.LastUpgradeRestartAt);
         PolicyBridge.SaveRestartStamps(stamps, isPaused);
 
         Program.SingleInstance?.ReleaseMutex();
@@ -785,6 +868,8 @@ sealed class WatcherContext : ApplicationContext
         SystemEvents.SessionSwitch -= OnSessionSwitch;
         sampleTimer.Stop();
         retryTimer.Stop();
+        deviceSettleTimer.Stop();
+        try { deviceWatcher.Stop(); } catch (Exception ex) { Log.Write($"device watcher stop: {ex.Message}"); }
         TeardownCamera();
         tray.Visible = false;
         tray.Dispose();

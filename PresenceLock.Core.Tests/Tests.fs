@@ -7,7 +7,7 @@ open PresenceLock.Core
 open PresenceLock.Core.Tests.Generators
 
 let private noStamps : RestartStamps =
-    { WedgeAt = System.Nullable(); ReevalAt = System.Nullable() }
+    { WedgeAt = System.Nullable(); ReevalAt = System.Nullable(); UpgradeAt = System.Nullable() }
 
 [<Fact>]
 let ``baseline status immediately after start is AcquiringCamera`` () =
@@ -22,7 +22,8 @@ let private someConfig : PolicyConfig =
       ReevaluateAfterMs = 20000L
       ReevaluateCooldownMs = 600000L
       RecoveryFailureThreshold = 3
-      RecoveryCooldownMs = 600000L }
+      RecoveryCooldownMs = 600000L
+      UpgradeCooldownMs = 600000L }
 
 [<Fact>]
 let ``a FaceSeen sample arms the state`` () =
@@ -212,7 +213,7 @@ let ``a cooldown-suppressed CameraReevaluation restart stays saturated and fires
     // A CameraReevaluation restart happened recently (wall-clock 500) before this process
     // even started -- randomized initial RestartStamps continuity (R2-19).
     let stampsRecentReeval: RestartStamps =
-        { WedgeAt = System.Nullable(); ReevalAt = System.Nullable(500L) }
+        { WedgeAt = System.Nullable(); ReevalAt = System.Nullable(500L); UpgradeAt = System.Nullable() }
     let state = Policy.start (MonotonicMs 0L, stampsRecentReeval)
     let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 500L, Event.InitSucceeded)
     let firstBad =
@@ -585,7 +586,7 @@ let ``a cooldown-suppressed InitFailed wedge restart stays saturated and fires i
     // A CameraWedged restart happened recently (wall-clock 500) before this process even
     // started -- randomized initial RestartStamps continuity (R2-19).
     let stampsRecentWedge: RestartStamps =
-        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable() }
+        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable(); UpgradeAt = System.Nullable() }
     let state = Policy.start (MonotonicMs 0L, stampsRecentWedge)
     let first = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 600L, Event.InitFailed true)
     let second = Policy.step (someConfig, first.State, MonotonicMs 1L, WallClockMs 700L, Event.InitFailed true)
@@ -648,7 +649,7 @@ let ``CaptureFailed while Paused still requests Action.Restart, and the restart 
 [<Fact>]
 let ``a cooldown-suppressed CaptureFailed returns Action.NoAction (the shell falls back to the NoFrame-to-reevaluation backstop)`` () =
     let stampsRecentWedge: RestartStamps =
-        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable() }
+        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable(); UpgradeAt = System.Nullable() }
     let state = Policy.start (MonotonicMs 0L, stampsRecentWedge)
     let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 500L, Event.InitSucceeded)
     let result = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 600L, Event.CaptureFailed)
@@ -662,7 +663,7 @@ let ``scenario: a cooldown-suppressed CaptureFailed recovers via the NoFrame-to-
     // Sample(NoFrame, ...) on every subsequent tick. This scenario reproduces exactly that using
     // only mechanisms slice 4 already implements -- no new recovery path.
     let stampsRecentWedge: RestartStamps =
-        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable() }
+        { WedgeAt = System.Nullable(500L); ReevalAt = System.Nullable(); UpgradeAt = System.Nullable() }
     let state = Policy.start (MonotonicMs 0L, stampsRecentWedge)
     let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 500L, Event.InitSucceeded)
     let suppressed = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 600L, Event.CaptureFailed)
@@ -684,6 +685,53 @@ let ``scenario: a cooldown-suppressed CaptureFailed recovers via the NoFrame-to-
             Event.Sample(Observation.NoFrame, 0L)
         )
     Assert.Equal(Action.Restart RestartReason.CameraReevaluation, laterBad.Action)
+
+// --- Slice 10: camera-arrival upgrade (RFC addendum 2026-08-01) -------------------------
+
+[<Fact>]
+let ``BetterCameraAvailable before any InitSucceeded is a no-op`` () =
+    // Pre-first-success (rfc-core-brain.md addendum): the acquisition retry loop already
+    // re-runs camera selection on every attempt, so a restart here would be pure waste.
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let result = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.BetterCameraAvailable)
+    Assert.Equal(Action.NoAction, result.Action)
+    Assert.Equal(Status.AcquiringCamera, Policy.status result.State)
+
+[<Fact>]
+let ``BetterCameraAvailable after InitSucceeded requests Action.Restart CameraUpgrade unconditionally on first occurrence, subject only to cooldown`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    // No prior CameraUpgrade restart -- cooldownElapsed is vacuously true against a null stamp.
+    let result = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 1L, Event.BetterCameraAvailable)
+    Assert.Equal(Action.Restart RestartReason.CameraUpgrade, result.Action)
+    let snap = Policy.snapshot (someConfig, result.State, MonotonicMs 1L)
+    Assert.Equal(System.Nullable(1L), snap.LastUpgradeRestartAt)
+
+[<Fact>]
+let ``a cooldown-suppressed BetterCameraAvailable returns Action.NoAction and leaves UpgradeAt unchanged`` () =
+    // A CameraUpgrade restart happened recently (wall-clock 500) before this process even
+    // started -- randomized initial RestartStamps continuity (R2-19 pattern).
+    let stampsRecentUpgrade: RestartStamps =
+        { WedgeAt = System.Nullable(); ReevalAt = System.Nullable(); UpgradeAt = System.Nullable(500L) }
+    let state = Policy.start (MonotonicMs 0L, stampsRecentUpgrade)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 500L, Event.InitSucceeded)
+    // Only 100ms of wall-clock have elapsed since UpgradeAt (500) -- well under
+    // UpgradeCooldownMs (600000) -- so the restart is suppressed.
+    let result = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 600L, Event.BetterCameraAvailable)
+    Assert.Equal(Action.NoAction, result.Action)
+    let snap = Policy.snapshot (someConfig, result.State, MonotonicMs 1L)
+    Assert.Equal(System.Nullable(500L), snap.LastUpgradeRestartAt)
+
+[<Fact>]
+let ``BetterCameraAvailable while Paused still requests Action.Restart CameraUpgrade, and the restart preserves the pause`` () =
+    // Deliberate parity with CaptureFailed's R2-10 asymmetry: an elective upgrade restart
+    // while paused/locked is harmless, and pause survives every self-restart by design.
+    let state = Policy.start (MonotonicMs 0L, noStamps)
+    let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
+    let pausedResult = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.Paused)
+    let result = Policy.step (someConfig, pausedResult.State, MonotonicMs 2L, WallClockMs 1L, Event.BetterCameraAvailable)
+    Assert.Equal(Action.Restart RestartReason.CameraUpgrade, result.Action)
+    Assert.Equal(Status.Paused, Policy.status result.State)
 
 [<Properties(Arbitrary = [| typeof<Generators> |])>]
 module PropertyTests =
@@ -1070,3 +1118,38 @@ module PropertyTests =
                 (result.State, nowMs', ok')
             let _, _, ok = List.fold folder (initialState, startMs, true) ticks
             ok)
+
+    // --- Property 12 (rfc-core-brain.md addendum 2026-08-01, slice 10) ---------------------
+
+    [<Property>]
+    let ``property 12: at most one Action.Restart CameraUpgrade per UpgradeCooldownMs window``
+        (config: PolicyConfig)
+        (stamps: RestartStamps)
+        (startAt: MonotonicMs)
+        (startWallAt: WallClockMs)
+        =
+        let (MonotonicMs startMs) = startAt
+        let (WallClockMs startWallMs) = startWallAt
+        Prop.forAll (Arb.fromGen wallTicksGen) (fun ticks ->
+            let initialState = Policy.start (MonotonicMs startMs, stamps)
+            let folder (state, nowMs, nowWallMs, fireTimesDesc) (deltaMs, event) =
+                let nowMs' = nowMs + deltaMs
+                let nowWallMs' = nowWallMs + deltaMs
+                let result = Policy.step (config, state, MonotonicMs nowMs', WallClockMs nowWallMs', event)
+                let fireTimesDesc' =
+                    match result.Action with
+                    | Action.Restart RestartReason.CameraUpgrade -> nowWallMs' :: fireTimesDesc
+                    | _ -> fireTimesDesc
+                (result.State, nowMs', nowWallMs', fireTimesDesc')
+            let _, _, _, fireTimesDesc =
+                List.fold folder (initialState, startMs, startWallMs, []) ticks
+            // Prepend the randomized initial stamp (R2-19 pattern), covering cross-restart
+            // cooldown continuity for the third restart reason exactly as properties 5/6 do
+            // for the first two.
+            let fireTimes =
+                match stamps.UpgradeAt with
+                | v when v.HasValue -> v.Value :: List.rev fireTimesDesc
+                | _ -> List.rev fireTimesDesc
+            fireTimes
+            |> List.pairwise
+            |> List.forall (fun (a, b) -> b - a >= config.UpgradeCooldownMs))

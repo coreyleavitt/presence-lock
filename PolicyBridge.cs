@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using Windows.Graphics.Imaging;
+using EnclosurePanel = Windows.Devices.Enumeration.Panel;
 using Core = PresenceLock.Core;
 
 namespace PresenceLock;
@@ -13,9 +14,10 @@ namespace PresenceLock;
 /// named and unit-tested (see PresenceLock.Tests) rather than left inline.
 static class PolicyBridge
 {
-    /// Built-in defaults for all eight `PolicyConfig` fields, applied as a unit (never a
-    /// partial mix — rfc-core-brain.md, "Config" validation rules) whenever the persisted
-    /// values fail validation. Matches the pinned mapping table exactly.
+    /// Built-in defaults for all nine `PolicyConfig` fields (the ninth, `UpgradeCooldownMs`,
+    /// added by the 2026-08-01 addendum), applied as a unit (never a partial mix —
+    /// rfc-core-brain.md, "Config" validation rules) whenever the persisted values fail
+    /// validation. Matches the pinned mapping table exactly.
     static readonly Core.PolicyConfig DefaultPolicyConfig = new(
         awayThresholdMs: 5000,
         inputIdleRequiredMs: 10000,
@@ -24,10 +26,11 @@ static class PolicyBridge
         reevaluateAfterMs: 20000,
         reevaluateCooldownMs: 600000,
         recoveryFailureThreshold: 3,
-        recoveryCooldownMs: 600000);
+        recoveryCooldownMs: 600000,
+        upgradeCooldownMs: 600000);
 
     /// Maps the flat, on-disk `Config` (unchanged schema) to `PolicyConfig`, per the pinned
-    /// mapping table. Validates the eight policy fields as a single unit — any one out of
+    /// mapping table. Validates the nine policy fields as a single unit — any one out of
     /// range falls the whole set back to `DefaultPolicyConfig`, never a partially-defaulted
     /// mix (rfc-core-brain.md: "a zero-filled cooldown would make the next camera hiccup an
     /// instant restart loop"). Sensing fields (`CameraNameContains`, `DarkFrameMeanThreshold`,
@@ -45,11 +48,12 @@ static class PolicyBridge
         long reevaluateCooldownMs = cfg.ReevaluateCooldownMs;
         int recoveryThreshold = cfg.RecoveryFailureThreshold;
         long recoveryCooldownMs = cfg.RecoveryCooldownMs;
+        long upgradeCooldownMs = cfg.UpgradeCooldownMs;
 
         bool valid =
             awayMs > 0 && idleMs > 0 && graceMs > 0 &&
             noSignalMs > 0 && reevaluateAfterMs > 0 && reevaluateCooldownMs > 0 &&
-            recoveryCooldownMs > 0 && recoveryThreshold >= 1 &&
+            recoveryCooldownMs > 0 && recoveryThreshold >= 1 && upgradeCooldownMs > 0 &&
             reevaluateAfterMs >= noSignalMs;
 
         if (!valid)
@@ -66,7 +70,8 @@ static class PolicyBridge
             reevaluateAfterMs: reevaluateAfterMs,
             reevaluateCooldownMs: reevaluateCooldownMs,
             recoveryFailureThreshold: recoveryThreshold,
-            recoveryCooldownMs: recoveryCooldownMs);
+            recoveryCooldownMs: recoveryCooldownMs,
+            upgradeCooldownMs: upgradeCooldownMs);
     }
 
     /// The real handle-invalid classifier (rfc-core-brain.md, "Notes: recovery boundary" /
@@ -161,7 +166,45 @@ static class PolicyBridge
             h: largest.Height / (double)frameHeight);
     }
 
-    static readonly Core.RestartStamps EmptyRestartStamps = new(wedgeAt: null, reevalAt: null);
+    /// Plain (id, display name, enclosure panel) projection of a candidate color camera
+    /// (rfc-core-brain.md addendum 2026-08-01, slice 10: camera-arrival upgrade) — the shape
+    /// `SelectPreferredCamera` ranks over, kept independent of any live WinRT device handle so
+    /// the ranking itself is unit-testable. `Id` is the candidate's `MediaFrameSourceInfo.Id`
+    /// (unique per color source, and the same key `InitCameraAsync` already used to look up
+    /// `capture.FrameSources[...]`); `Panel` is normalized to `EnclosurePanel.Unknown` for a
+    /// camera reporting no enclosure location at all (an external USB webcam), exactly as
+    /// `InitCameraAsync`'s original inline `SelectionRank` treated a null `EnclosureLocation`.
+    internal readonly record struct CameraCandidate(string Id, string DisplayName, EnclosurePanel Panel);
+
+    /// The camera preference ranking (rfc-core-brain.md addendum 2026-08-01, slice 10): the
+    /// exact ordering `InitCameraAsync` computed inline before this slice — a non-blank user
+    /// filter wins outright (first candidate whose display name contains it, case-insensitive,
+    /// preserving input order), else external-over-built-in-front (no enclosure location /
+    /// `Unknown` ranks best, `Front` next, any other known panel last). Factored out as a pure,
+    /// pane-agnostic function so startup selection (`InitCameraAsync`) and the arrival-triggered
+    /// `DeviceWatcher` settle check share one implementation rather than re-deriving the
+    /// ordering independently. Returns `null` only when `candidates` is empty — the caller's
+    /// "no color camera found" is a shell-level concern, not this function's.
+    internal static string? SelectPreferredCamera(IReadOnlyList<CameraCandidate> candidates, string nameFilter)
+    {
+        if (candidates.Count == 0) return null;
+
+        if (!string.IsNullOrWhiteSpace(nameFilter))
+        {
+            foreach (var candidate in candidates)
+                if (candidate.DisplayName.Contains(nameFilter, StringComparison.OrdinalIgnoreCase))
+                    return candidate.Id;
+        }
+
+        return candidates.OrderBy(c => PanelRank(c.Panel)).First().Id;
+    }
+
+    // External USB webcams report no enclosure panel (normalized to Unknown above); prefer
+    // them over the built-in camera, which sees only the lid when docked closed.
+    static int PanelRank(EnclosurePanel panel) =>
+        panel == EnclosurePanel.Unknown ? 0 : panel == EnclosurePanel.Front ? 1 : 2;
+
+    static readonly Core.RestartStamps EmptyRestartStamps = new(wedgeAt: null, reevalAt: null, upgradeAt: null);
 
     static readonly string StampsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -186,7 +229,7 @@ static class PolicyBridge
             {
                 var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(StampsPath));
                 if (dto is not null)
-                    return new Core.RestartStamps(wedgeAt: dto.WedgeAt, reevalAt: dto.ReevalAt);
+                    return new Core.RestartStamps(wedgeAt: dto.WedgeAt, reevalAt: dto.ReevalAt, upgradeAt: dto.UpgradeAt);
             }
         }
         catch (Exception ex)
@@ -208,7 +251,13 @@ static class PolicyBridge
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(StampsPath)!);
-            var dto = new RestartStampsDto { WedgeAt = stamps.WedgeAt, ReevalAt = stamps.ReevalAt, Paused = paused };
+            var dto = new RestartStampsDto
+            {
+                WedgeAt = stamps.WedgeAt,
+                ReevalAt = stamps.ReevalAt,
+                UpgradeAt = stamps.UpgradeAt,
+                Paused = paused,
+            };
             File.WriteAllText(StampsPath, JsonSerializer.Serialize(dto, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch (Exception ex)
@@ -246,7 +295,13 @@ static class PolicyBridge
             var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(StampsPath));
             if (dto is null || !dto.Paused) return false;
 
-            var cleared = new RestartStampsDto { WedgeAt = dto.WedgeAt, ReevalAt = dto.ReevalAt, Paused = false };
+            var cleared = new RestartStampsDto
+            {
+                WedgeAt = dto.WedgeAt,
+                ReevalAt = dto.ReevalAt,
+                UpgradeAt = dto.UpgradeAt,
+                Paused = false,
+            };
             File.WriteAllText(StampsPath, JsonSerializer.Serialize(cleared, new JsonSerializerOptions { WriteIndented = true }));
             return true;
         }
@@ -261,6 +316,10 @@ static class PolicyBridge
     {
         public long? WedgeAt { get; init; }
         public long? ReevalAt { get; init; }
+        // RFC addendum 2026-08-01, slice 10: absent on an old two-field stamps file, which
+        // deserializes it as null — exactly how WedgeAt/ReevalAt already behaved before their
+        // first restart of either reason had ever fired. Back-compat by construction.
+        public long? UpgradeAt { get; init; }
         public bool Paused { get; init; }
     }
 }

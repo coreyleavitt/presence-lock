@@ -77,6 +77,7 @@ sealed class SettingsForm : Form
             ReevaluateCooldownMs = current.ReevaluateCooldownMs,
             RecoveryFailureThreshold = current.RecoveryFailureThreshold,
             RecoveryCooldownMs = current.RecoveryCooldownMs,
+            UpgradeCooldownMs = current.UpgradeCooldownMs,
         };
         var buttons = new FlowLayoutPanel
         {

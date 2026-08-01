@@ -267,6 +267,32 @@ module Policy =
                 let updated = { state with Stamps = stamps } |> withRecomputedStatus (config, now)
                 let action = if restartDue then Action.Restart RestartReason.CameraWedged else Action.NoAction
                 { State = updated; Action = action }
+        | Event.BetterCameraAvailable ->
+            // RFC addendum 2026-08-01 (slice 10: camera-arrival upgrade). Elective restart:
+            // deliberately not gated by IsPaused/IsSessionLocked, for the same one-coherent-
+            // rule-beats-three-special-cases reasoning as the other restart-requesting events
+            // (R2-10) -- pause persists across the restart, and an elective restart while
+            // paused/locked is harmless. Pre-first-success this is a no-op: the acquisition
+            // retry loop already re-runs camera selection on every attempt, so a restart here
+            // would be pure waste (mirrors CaptureFailed's pre-success no-op, which is real
+            // here too since a device-arrival check only ever runs once a camera is in use).
+            // Single call site for CameraUpgrade, so the cooldown/stamp handling is inline
+            // via cooldownElapsed -- the same idiom requestWedgeRestart factors out for the
+            // two CameraWedged call sites -- mirroring ReevalAt's inline handling above rather
+            // than introducing a shared helper for a reason with only one producer.
+            if not state.HasSucceededOnce then
+                { State = state; Action = Action.NoAction }
+            else
+                let (WallClockMs nowWallMs) = nowWall
+                let upgradeDue = cooldownElapsed (nowWallMs, config.UpgradeCooldownMs, state.Stamps.UpgradeAt)
+                let stamps =
+                    if upgradeDue then
+                        { state.Stamps with UpgradeAt = System.Nullable(nowWallMs) }
+                    else
+                        state.Stamps
+                let updated = { state with Stamps = stamps } |> withRecomputedStatus (config, now)
+                let action = if upgradeDue then Action.Restart RestartReason.CameraUpgrade else Action.NoAction
+                { State = updated; Action = action }
 
     /// Computed during `step` and cached in `State` — reflects the world as of the most
     /// recent event, at most one sample interval stale under normal sampling; the shell reads
@@ -291,4 +317,5 @@ module Policy =
           NoSignalForMs = noSignalForMs
           InitFailStreak = state.InitFailStreak
           LastWedgeRestartAt = state.Stamps.WedgeAt
-          LastReevalRestartAt = state.Stamps.ReevalAt }
+          LastReevalRestartAt = state.Stamps.ReevalAt
+          LastUpgradeRestartAt = state.Stamps.UpgradeAt }

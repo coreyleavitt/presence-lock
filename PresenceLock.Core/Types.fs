@@ -43,7 +43,10 @@ type PolicyConfig =
       /// Consecutive pre-success `InitFailed` events before requesting a recovery restart.
       RecoveryFailureThreshold: int
       /// Minimum wall-clock gap between `CameraWedged` restarts.
-      RecoveryCooldownMs: int64 }
+      RecoveryCooldownMs: int64
+      /// Minimum wall-clock gap between `CameraUpgrade` restarts (RFC addendum 2026-08-01,
+      /// slice 10: camera-arrival upgrade). Ninth and final field of the validation unit.
+      UpgradeCooldownMs: int64 }
 
 [<RequireQualifiedAccess>]
 type Observation =
@@ -67,6 +70,12 @@ type Event =
     | SessionUnlocked
     | Paused
     | Resumed
+    /// A preferred camera became available post-acquisition (RFC addendum 2026-08-01, slice
+    /// 10: camera-arrival upgrade) — fed by the shell after device-arrival settle + a
+    /// preference check finds the would-pick-now camera differs from the in-use one. Carries
+    /// no payload: the decision is cooldown-gated only, with no classification to gate on —
+    /// see "Notes: recovery boundary"'s `CaptureFailed` for the identical rationale shape.
+    | BetterCameraAvailable
 
 /// Semantic status; the shell renders strings from it (pulled, never pushed) — see
 /// `Policy.status`. Total and priority-ordered over `State` — see the priority table in the
@@ -84,6 +93,9 @@ type Status =
 type RestartReason =
     | CameraWedged
     | CameraReevaluation
+    /// RFC addendum 2026-08-01, slice 10: a preferred camera arrived and the shell's ranking
+    /// function would now pick differently than the in-use camera.
+    | CameraUpgrade
 
 /// Exactly one `Action` per step — cardinality is enforced by the type, not by convention.
 [<RequireQualifiedAccess>]
@@ -96,14 +108,17 @@ type Action =
 
 /// Persisted wall-clock (Unix-epoch ms) restart stamps, one per `RestartReason`, carried
 /// across process restarts by the shell. `Nullable` (not `option`) deliberately: this type is
-/// constructed at the C# boundary (`RestartStamps.WedgeAt`/`.ReevalAt` set from a JSON stamps
-/// file) and never compared against the monotonic clock. A `Map<RestartReason, int64>` shape
-/// indexed by the DU was considered and deferred: with two reasons and the third known
-/// candidate explicitly out of scope, hand-named fields are the simpler C#-boundary optimum;
-/// revisit only if `RestartReason` grows.
+/// constructed at the C# boundary (`RestartStamps.WedgeAt`/`.ReevalAt`/`.UpgradeAt` set from a
+/// JSON stamps file) and never compared against the monotonic clock. A `Map<RestartReason,
+/// int64>` shape indexed by the DU was considered and deferred at two reasons (R2-40); slice
+/// 10 (RFC addendum 2026-08-01) adds the third, previously-named candidate (`CameraUpgrade`),
+/// confirming named `Nullable` fields remain the right shape at three — the flat-json schema
+/// stays backward compatible (an absent key loads as null, exactly like the first two fields
+/// did before any restart of that reason had ever fired).
 type RestartStamps =
     { WedgeAt: Nullable<int64>
-      ReevalAt: Nullable<int64> }
+      ReevalAt: Nullable<int64>
+      UpgradeAt: Nullable<int64> }
 
 /// Opaque decision state. The type itself is public — the shell holds and threads a `State`
 /// value through its `Advance` chokepoint — but its representation is `internal`: invisible
@@ -165,7 +180,8 @@ type Snapshot =
       /// Nullable, not option — same C#-boundary rationale as `RestartStamps`: the shell's
       /// logging code consumes `Snapshot` directly and must never touch `FSharpOption`.
       LastWedgeRestartAt: Nullable<int64>
-      LastReevalRestartAt: Nullable<int64> }
+      LastReevalRestartAt: Nullable<int64>
+      LastUpgradeRestartAt: Nullable<int64> }
 
 /// Named struct rather than a positional `State * Action` tuple: no per-sample tuple
 /// allocation on the hot path, and C# reads `.State`/`.Action` instead of `.Item1`/`.Item2`.
