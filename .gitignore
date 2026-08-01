@@ -14,3 +14,8 @@ cert/
 
 # Local scratch
 *.log
+
+# AI/agent working artifacts — not part of the project
+CLAUDE.md
+.claude/
+*.handoff.md
