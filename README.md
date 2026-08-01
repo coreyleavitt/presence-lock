@@ -23,7 +23,7 @@ The shell decides *nothing*; the core touches *nothing*. That boundary is what m
 the safety-critical logic — when to lock, when not to, when to recover — exhaustively
 unit- and property-testable.
 
-## Design decisions worth calling out
+## Design notes
 
 - **Two clock domains, made unforgeable by the type system.** Timing uses monotonic
   milliseconds (`Environment.TickCount64`) for grace/idle/away windows, and wall-clock
@@ -32,17 +32,29 @@ unit- and property-testable.
   the other is expected is a **compile error in both F# and C#**, not a latent unit bug
   — the two values are otherwise adjacent, swappable `int64`s constructed back-to-back
   on every event.
-- **Fail-closed by default.** Dim light, blocked lens, or dropped frames report
-  `NoSignal` and *never* lock — a false lock is worse than a missed one. If the
-  monotonic clock ever goes backwards, every elapsed-time comparison fails closed
+- **Fail open on bad signal.** Dim light, a blocked lens, or dropped frames report
+  `NoSignal` and *never* lock — a false lock-out is worse than a missed lock, and the
+  separate input-idle gate already prevents locking an actively working user. If the
+  monotonic clock ever goes backwards, every elapsed-time comparison fails safe
   (never lock, never restart) rather than throwing or wrapping.
+- **Presence is debounced in time and space.** Face detectors flicker false positives
+  on empty scenes (threshold-marginal luminance patterns, aggravated by auto-framing
+  camera pipelines). A raw detection only counts as presence after several consecutive
+  frames whose bounding boxes overlap (`PresenceFilter`, pure F#, property-tested):
+  real faces produce spatially coherent boxes; phantoms wander. Absence needs no such
+  filter — the away threshold already integrates it over seconds.
 - **Initialize the camera once per process; never re-initialize in-process.** Tearing
   down and re-initializing the capture pipeline wedges the Windows Camera Frame Server
   service machine-wide (`E_HANDLE`, persistent until an elevated service restart). This
   invariant is *structurally enforced*: the in-process re-init paths are gone, and any
   recovery that needs a fresh pipeline is an `Action.Restart` decided by the core and
-  executed as a graceful process self-restart by the shell. The camera deliberately
-  stays live (LED on) across a session lock.
+  executed as a graceful process self-restart by the shell. Camera *switching* follows
+  the same rule — each process initializes exactly one camera, exactly once, and every
+  switch is a handoff to a fresh process. Losing the camera (undocking) surfaces as a
+  capture failure and restarts onto the best remaining device; a *better* camera
+  arriving (docking) is noticed by a device watcher, debounced, and triggers a
+  cooldown-gated upgrade restart. The camera deliberately stays live (LED on) across
+  a session lock.
 - **Sleep/hibernate correctness.** `TickCount64` includes time spent suspended and
   shares its tick base with `GetLastInputInfo`, so idle and away windows elapse
   consistently across a suspend without special-casing wake.
@@ -73,6 +85,10 @@ dotnet test PresenceLock.Core.Tests/PresenceLock.Core.Tests.fsproj -c Release
 
 `pack.ps1` compiles and tests in `mcr.microsoft.com/dotnet/sdk:10.0-windowsservercore-ltsc2022`,
 then runs `makeappx`/`signtool` on the host (Server Core containers lack the AppX COM surface).
+
+To upgrade an installed build: stop the running instance, then
+`Add-AppxPackage out\PresenceLock.msix`. Configuration is read from
+`%LOCALAPPDATA%\PresenceLock\presencelock.json`; the log lives beside it.
 
 ## License
 
