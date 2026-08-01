@@ -12,6 +12,9 @@
     <AssemblyName>PresenceLock</AssemblyName>
     <RootNamespace>PresenceLock</RootNamespace>
     <ApplicationIcon>icon.ico</ApplicationIcon>
+    <!-- Allow building this Windows-targeted project from Linux SDK containers
+         (cross-compilation only; the output still runs on Windows). -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
   </PropertyGroup>
 
   <ItemGroup>

@@ -37,9 +37,14 @@ Windows container. The core test suite is a hard gate on packaging.
 # Compile, test, and pack a signed MSIX (see pack.ps1 for the container pattern)
 ./pack.ps1
 
-# Core tests only (run in the SDK Windows container)
-dotnet test PresenceLock.Core.Tests/PresenceLock.Core.Tests.fsproj -c Release
+# Fast inner loop: core test suite in a Linux SDK container via podman (seconds)
+./test.ps1
 ```
+
+The core targets plain `net10.0`, so its tests run natively in a Linux container;
+the Windows-targeted projects cross-compile there too (`EnableWindowsTargeting`),
+but the shell test suite still executes in the Windows container as part of the
+`pack.ps1` release gate.
 
 `pack.ps1` compiles and tests in `mcr.microsoft.com/dotnet/sdk:10.0-windowsservercore-ltsc2022`,
 then runs `makeappx`/`signtool` on the host (Server Core containers lack the AppX COM surface).
