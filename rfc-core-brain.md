@@ -680,3 +680,44 @@ Each slice is independently testable; 1–6 (including the properties folded int
 entirely in the container. Slices 8a–8c touch the Windows shell and cannot run in the
 container; slice 9 is the only slice that touches a real camera, a real session, and a real
 reboot.
+
+## Addendum: camera-arrival upgrade (2026-08-01, post-cutover — slice 10)
+
+Closes the R1-39 out-of-scope gap, promoted to in-scope by Corey after days of live 1.0.8.0
+use: docking (LifeCam arrival) never switches away from a healthy internal camera, because
+selection runs once at process start and restarts fire only on failure paths. Design follows
+the reviewed restart patterns exactly; this is the "third reason" R2-40 anticipated (named
+`Nullable` stamp fields remain the right shape at three).
+
+**Core contract changes (the only post-cutover contract amendment):**
+- `Event.BetterCameraAvailable` — fed by the shell after device-arrival settle + preference
+  check. Semantics in `step`: if `HasSucceededOnce` and `UpgradeCooldownMs` has elapsed since
+  `Stamps.UpgradeAt` (wall clock), emit `Action.Restart RestartReason.CameraUpgrade`;
+  otherwise `NoAction`. Not gated by `Paused`/`SessionLocked` (consistent with failure
+  events: pause persists across restarts, an elective restart while paused/locked is
+  harmless, and one coherent rule beats three special cases). Pre-first-success it is a
+  no-op: the acquisition retry loop re-runs selection anyway, so a restart would be waste.
+- `RestartReason.CameraUpgrade`; `RestartStamps`/`Snapshot` gain `UpgradeAt` /
+  `LastUpgradeRestartAt` (`Nullable<int64>`, wall clock); `PolicyConfig` gains
+  `UpgradeCooldownMs` (default 600000) — the validation unit becomes nine fields, the
+  flat-json schema stays backward compatible (absent key → default; stamps file: absent →
+  null).
+- FsCheck property 12: at most one `Restart CameraUpgrade` per `UpgradeCooldownMs` window,
+  quantified over randomized initial stamps including just-restarted (R2-19 pattern).
+
+**Shell changes:**
+- `DeviceWatcher` over video-capture devices, events marshaled to the UI thread (same
+  precedent as SessionSwitch). Ignore the initial-enumeration `Added` backfill — react only
+  after `EnumerationCompleted`. On a genuine arrival, debounce with a settle timer (~5 s,
+  restarted per event — docks enumerate several devices over seconds), then compare.
+- Camera preference factored into a pure, unit-tested ranking function in `PolicyBridge`
+  operating on plain (name, panel) data — the same ordering `StartWatchingAsync` uses (user
+  filter match, else external over built-in front), used by both startup selection and the
+  watcher. If the would-pick-now camera differs from the in-use one →
+  `Advance(Event.BetterCameraAvailable)`; the core decides, `RestartProcess` writes the
+  `UpgradeAt` stamp for the reason it executes (R1-29 rule unchanged).
+- Removals need no handling here: device loss surfaces as `CaptureFailed` (existing path).
+
+**Verification:** container tests (core + shell) green; live check = dock → within settle +
+restart time the log shows the upgrade restart and the new process on the LifeCam; ships as
+1.0.8.1 and folds into the combined slice-9 smoke.
