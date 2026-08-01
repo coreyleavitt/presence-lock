@@ -1,0 +1,18 @@
+<Project>
+  <!--
+    Builds run from both Linux and Windows containers against this same source
+    tree (see pack.ps1). Partition obj/ and bin/ by OS so the two toolchains
+    never clobber each other's intermediates (mixed-OS obj state breaks
+    incremental builds with missing-metadata errors).
+  -->
+  <PropertyGroup>
+    <_BuildOsTag Condition="$([MSBuild]::IsOSPlatform('Windows'))">win</_BuildOsTag>
+    <_BuildOsTag Condition="'$(_BuildOsTag)' == ''">linux</_BuildOsTag>
+    <BaseIntermediateOutputPath>obj/$(_BuildOsTag)/</BaseIntermediateOutputPath>
+    <BaseOutputPath>bin/$(_BuildOsTag)/</BaseOutputPath>
+    <!-- Each OS's build only auto-excludes its own obj/bin partition; exclude
+         the whole tree so one OS's generated sources never leak into the
+         other's default Compile glob (CS0579 duplicate-attribute errors). -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj/**;bin/**</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>
