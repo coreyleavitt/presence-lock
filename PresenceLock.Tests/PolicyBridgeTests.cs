@@ -160,6 +160,45 @@ public class BuildPolicyConfigTests
         Assert.Equal(expectedDefaults.UpgradeCooldownMs, policy.UpgradeCooldownMs);
     }
 
+    /// Bug fix (false-lock window): worst-case re-stabilization after one dropped detection is
+    /// ~one sample gap plus the filter's MinCoherentMs dwell; if AwayThresholdMs can be lower
+    /// than that, a single dropped detection under fast sampling can make the away clock fire
+    /// before presence has had a chance to re-stabilize -- a false lock while the user never
+    /// left. The floor is exactly at the boundary here: AwayThresholdSeconds=2.0s * 1000 = 2000ms
+    /// == FilterConfig.Default.MinCoherentMs (1000ms) + 2 * the default SampleIntervalMs (500ms).
+    [Fact]
+    public void Away_at_the_MinCoherentMs_plus_two_sample_intervals_floor_passes()
+    {
+        var cfg = new Config { AwayThresholdSeconds = 2.0, SampleIntervalMs = 500 };
+
+        var policy = PolicyBridge.BuildPolicyConfig(cfg);
+
+        Assert.Equal(2000, policy.AwayThresholdMs);
+    }
+
+    [Fact]
+    public void Away_below_the_MinCoherentMs_plus_two_sample_intervals_floor_falls_back_to_defaults()
+    {
+        var cfg = new Config { AwayThresholdSeconds = 1.5, SampleIntervalMs = 500 }; // 1500ms < 2000ms floor
+
+        var policy = PolicyBridge.BuildPolicyConfig(cfg);
+        var defaults = PolicyBridge.BuildPolicyConfig(new Config());
+
+        Assert.Equal(defaults.AwayThresholdMs, policy.AwayThresholdMs);
+    }
+
+    /// The floor scales with SampleIntervalMs, not a fixed constant: at a faster sample rate a
+    /// smaller away threshold is still safe.
+    [Fact]
+    public void Away_floor_scales_with_a_custom_SampleIntervalMs()
+    {
+        var cfg = new Config { AwayThresholdSeconds = 1.5, SampleIntervalMs = 250 }; // 1500ms == 1000 + 2*250
+
+        var policy = PolicyBridge.BuildPolicyConfig(cfg);
+
+        Assert.Equal(1500, policy.AwayThresholdMs);
+    }
+
     [Fact]
     public void Sensing_only_fields_are_not_part_of_PolicyConfig_and_do_not_affect_the_fallback()
     {
@@ -172,6 +211,109 @@ public class BuildPolicyConfigTests
 
         Assert.Equal(defaults.AwayThresholdMs, policy.AwayThresholdMs);
         Assert.Equal(defaults.RecoveryCooldownMs, policy.RecoveryCooldownMs);
+    }
+}
+
+/// Frozen-frame classification (bug fix): `TryAcquireLatestFrame` can re-serve a cached frame
+/// forever (a known WinRT quirk) -- a stale frame must be treated exactly as if no frame had
+/// been acquired at all, so the existing fail-open NoFrame path (reset the away baseline,
+/// accrue the no-signal clock, eventually restart) recovers the pipe with zero new mechanism.
+public class EffectiveHaveFrameTests
+{
+    [Fact]
+    public void A_fresh_acquired_frame_counts_as_a_frame()
+    {
+        Assert.True(PolicyBridge.EffectiveHaveFrame(haveFrame: true, frameIsFresh: true));
+    }
+
+    [Fact]
+    public void No_frame_was_acquired_regardless_of_freshness()
+    {
+        Assert.False(PolicyBridge.EffectiveHaveFrame(haveFrame: false, frameIsFresh: true));
+        Assert.False(PolicyBridge.EffectiveHaveFrame(haveFrame: false, frameIsFresh: false));
+    }
+
+    [Fact]
+    public void A_stale_frame_is_treated_as_no_frame_even_though_one_was_acquired()
+    {
+        Assert.False(PolicyBridge.EffectiveHaveFrame(haveFrame: true, frameIsFresh: false));
+    }
+}
+
+/// Bug fix (startup crash on a corrupted/hand-edited presencelock.json): `Config.Load()`
+/// deserializes with no bounds check, and `WinFormsTimer.Interval` throws
+/// `ArgumentOutOfRangeException` for a `SampleIntervalMs` &lt; 1 — a bad on-disk value killed
+/// the app at startup before the tray icon even existed. Sensing fields are deliberately
+/// independent (mirrors BuildPolicyConfig's comment that sensing fields stay untouched by the
+/// policy-field all-or-nothing unit) — each is validated and defaulted on its own, never as a
+/// unit with the others, and never touching any policy field.
+public class SanitizeSensingConfigTests
+{
+    [Fact]
+    public void In_range_sensing_fields_pass_through_untouched()
+    {
+        var cfg = new Config { SampleIntervalMs = 750, DarkFrameMeanThreshold = 12.5 };
+
+        var sanitized = PolicyBridge.SanitizeSensingConfig(cfg);
+
+        Assert.Equal(750, sanitized.SampleIntervalMs);
+        Assert.Equal(12.5, sanitized.DarkFrameMeanThreshold);
+    }
+
+    [Theory]
+    [InlineData(99)]
+    [InlineData(10001)]
+    [InlineData(0)]
+    public void Out_of_range_SampleIntervalMs_falls_back_to_the_default_independently_of_DarkFrameMeanThreshold(int badValue)
+    {
+        var cfg = new Config { SampleIntervalMs = badValue, DarkFrameMeanThreshold = 12.5 };
+
+        var sanitized = PolicyBridge.SanitizeSensingConfig(cfg);
+
+        Assert.Equal(new Config().SampleIntervalMs, sanitized.SampleIntervalMs);
+        Assert.Equal(12.5, sanitized.DarkFrameMeanThreshold);
+    }
+
+    [Theory]
+    [InlineData(-0.1)]
+    [InlineData(255.1)]
+    public void Out_of_range_DarkFrameMeanThreshold_falls_back_to_the_default_independently_of_SampleIntervalMs(double badValue)
+    {
+        var cfg = new Config { DarkFrameMeanThreshold = badValue, SampleIntervalMs = 750 };
+
+        var sanitized = PolicyBridge.SanitizeSensingConfig(cfg);
+
+        Assert.Equal(new Config().DarkFrameMeanThreshold, sanitized.DarkFrameMeanThreshold);
+        Assert.Equal(750, sanitized.SampleIntervalMs);
+    }
+
+    [Fact]
+    public void Sanitizing_a_sensing_field_never_alters_any_policy_field()
+    {
+        var cfg = new Config
+        {
+            SampleIntervalMs = 0,
+            DarkFrameMeanThreshold = 999,
+            AwayThresholdSeconds = 42.0,
+            RecoveryFailureThreshold = 7,
+        };
+
+        var sanitized = PolicyBridge.SanitizeSensingConfig(cfg);
+
+        Assert.Equal(42.0, sanitized.AwayThresholdSeconds);
+        Assert.Equal(7, sanitized.RecoveryFailureThreshold);
+    }
+
+    [Fact]
+    public void Boundary_values_at_the_edges_of_the_valid_range_pass_through_untouched()
+    {
+        var low = PolicyBridge.SanitizeSensingConfig(new Config { SampleIntervalMs = 100, DarkFrameMeanThreshold = 0.0 });
+        Assert.Equal(100, low.SampleIntervalMs);
+        Assert.Equal(0.0, low.DarkFrameMeanThreshold);
+
+        var high = PolicyBridge.SanitizeSensingConfig(new Config { SampleIntervalMs = 10000, DarkFrameMeanThreshold = 255.0 });
+        Assert.Equal(10000, high.SampleIntervalMs);
+        Assert.Equal(255.0, high.DarkFrameMeanThreshold);
     }
 }
 

@@ -38,12 +38,30 @@ unit- and property-testable.
   separate input-idle gate already prevents locking an actively working user. If the
   monotonic clock ever goes backwards, every elapsed-time comparison fails safe
   (never lock, never restart) rather than throwing or wrapping.
-- **Presence is debounced in time and space.** Face detectors flicker false positives
-  on empty scenes (threshold-marginal luminance patterns, aggravated by auto-framing
-  camera pipelines). A raw detection only counts as presence after several consecutive
-  frames whose bounding boxes overlap (`PresenceFilter`, pure F#, property-tested):
-  real faces produce spatially coherent boxes; phantoms wander. Absence needs no such
-  filter — the away threshold already integrates it over seconds.
+- **Presence is debounced in time and space, never in sample count.** Face detectors
+  flicker false positives on empty scenes (threshold-marginal luminance patterns,
+  aggravated by auto-framing camera pipelines). A raw detection only counts as presence
+  once an unbroken run of spatially coherent detections (`PresenceFilter`, pure F#,
+  property-tested) has spanned a minimum *duration* of monotonic time — real faces
+  produce spatially coherent boxes over time; phantoms wander. Coupling stability to a
+  sample count instead of a duration was tried and found to reproduce the same class of
+  bug the two clock domains above exist to prevent: its real-world meaning would drift
+  with `SampleIntervalMs`, and a single dropped detection under fast sampling could cost
+  disproportionately more re-stabilization time than the away clock — measured in real
+  time — gives back, risking a false lock while the user never left. A Schmitt-trigger
+  hysteresis (a looser IoU bar once a run has already reached stability, a stricter one
+  to acquire it) keeps an established run sticky against ordinary IoU jitter without
+  loosening acquisition. Absence needs no such filter — the away threshold already
+  integrates it over seconds.
+- **A frozen frame is treated as no frame.** `TryAcquireLatestFrame` can re-serve the
+  same cached frame indefinitely (a known WinRT quirk) if the underlying pipe has
+  stalled. `FrameFreshness` (pure F#, time-based for the identical reason as
+  `PresenceFilter` above) tracks whether the frame source's own timestamp is still
+  advancing; once it has been frozen past a threshold, the sample is classified exactly
+  as if no frame had been acquired at all. This costs no new recovery mechanism — the
+  existing fail-open `NoSignal` accounting already resets the away baseline and, if the
+  staleness persists, drives the same re-evaluation restart that recovers any other dead
+  signal.
 - **Initialize the camera once per process; never re-initialize in-process.** Tearing
   down and re-initializing the capture pipeline wedges the Windows Camera Frame Server
   service machine-wide (`E_HANDLE`, persistent until an elevated service restart). This

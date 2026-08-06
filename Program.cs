@@ -71,8 +71,12 @@ sealed class Config
         {
             try
             {
+                // Bounds-checked before it ever reaches the timer (bug fix: WinFormsTimer.Interval
+                // throws for SampleIntervalMs < 1, killing the app at startup before the tray icon
+                // exists) -- every field of a hand-edited or corrupted on-disk config is sanitized
+                // here, on every path that produced a deserialized value.
                 if (File.Exists(path))
-                    return JsonSerializer.Deserialize<Config>(File.ReadAllText(path)) ?? new Config();
+                    return PolicyBridge.SanitizeSensingConfig(JsonSerializer.Deserialize<Config>(File.ReadAllText(path)) ?? new Config());
             }
             catch (Exception ex)
             {
@@ -121,10 +125,18 @@ sealed class WatcherContext : ApplicationContext
     // raw per-frame FaceDetector output flickers false-positive on an empty scene under a
     // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/Advance, so every
     // downstream consumer sees the identical stabilized presence signal. Reset to
-    // `Core.PresenceFilter.initial` wherever a fresh camera acquisition succeeds — see
-    // `StartWatchingAsync` — since spatial coherence measured against a previous acquisition's
-    // frames must never carry into a new one.
+    // `Core.PresenceFilter.initial` everywhere Policy resets its own armed/away/signal-health
+    // baseline: `StartWatchingAsync`'s init-success path, the session-unlock path in
+    // OnSessionSwitch (only when the unlock actually re-baselined -- i.e. wasn't a no-op while
+    // paused), and TogglePause's resume branch — since spatial coherence measured against a
+    // previous acquisition's or watching episode's frames must never carry into a new one.
     Core.FilterState presenceFilterState;
+    // Frozen-frame staleness (rfc-core-brain.md bug-fix note): tracks whether the frame
+    // reader's SystemRelativeTime is still advancing. Stepped in SampleAsync alongside
+    // presenceFilterState, and reset at exactly the same points — a fresh acquisition's or
+    // watching episode's first frame must not be judged stale against a previous acquisition's
+    // or episode's last-seen timestamp.
+    Core.FreshnessState frameFreshnessState;
     readonly NotifyIcon tray;
     readonly ToolStripMenuItem statusItem;
     readonly ToolStripMenuItem pauseItem;
@@ -163,13 +175,13 @@ sealed class WatcherContext : ApplicationContext
 
     // Sensing diagnostics: the log records decisions only, so a feed that keeps
     // "seeing" a face produces total silence while locks never fire. Logs
-    // observation-kind transitions and frozen frame timestamps (a pipeline that
-    // stops delivering frames makes TryAcquireLatestFrame re-serve the last
-    // cached frame — indistinguishable from live presence without this).
+    // observation-kind transitions and the authoritative Core.FrameFreshness
+    // fresh<->stale transition (a pipeline that stops delivering frames makes
+    // TryAcquireLatestFrame re-serve the last cached frame — SampleAsync's freshness
+    // gate, not this field, is what stops that from being misread as live presence;
+    // this field only remembers the previous verdict so the transition logs once).
     Core.Observation? diagLastObs;
-    TimeSpan? diagLastFrameTime;
-    int diagStaleRun;
-    bool diagStaleLogged;
+    bool diagWasStale;
 
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool LockWorkStation();
@@ -263,6 +275,7 @@ sealed class WatcherContext : ApplicationContext
             Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
             PolicyBridge.LoadRestartStamps());
         presenceFilterState = Core.PresenceFilter.initial;
+        frameFreshnessState = Core.FrameFreshness.initial;
 
         // Paused-flag consume-and-clear (rfc-core-brain.md R2-11, pinned lifecycle): read →
         // feed Event.Paused through Advance immediately after Policy.start → rewrite cleared.
@@ -281,8 +294,11 @@ sealed class WatcherContext : ApplicationContext
         if (starting) return;
         starting = true;
         // Fresh camera = fresh filter: spatial coherence measured against the previous
-        // acquisition's frames must never carry into this one.
+        // acquisition's frames must never carry into this one. Same rationale for freshness:
+        // a fresh acquisition's first timestamp must not be compared against the previous
+        // acquisition's last one.
         presenceFilterState = Core.PresenceFilter.initial;
+        frameFreshnessState = Core.FrameFreshness.initial;
         try
         {
             if (!FaceDetector.IsSupported)
@@ -401,7 +417,13 @@ sealed class WatcherContext : ApplicationContext
     // call), so `obs`/`diagLastObs` transitions now reflect stabilized observations; `rawFaceCount`
     // is appended so the raw FaceDetector signal a stabilized FaceSeen/NoFace transition summarizes
     // is still visible in the log (rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28").
-    void LogSensingDiagnostics(bool haveFrame, bool dark, bool present, TimeSpan? frameTime, long idleMs, int rawFaceCount)
+    // `frameIsFresh` is the authoritative Core.FrameFreshness verdict SampleAsync already
+    // computed for this sample — `null` when freshness couldn't be assessed (no frame acquired,
+    // or SystemRelativeTime unavailable) — this method only logs its fresh<->stale transition,
+    // it does not independently detect staleness (the redundant parallel 10-count detector this
+    // method used to keep for that is gone; SampleAsync's classification is the one source of
+    // truth now).
+    void LogSensingDiagnostics(bool haveFrame, bool dark, bool present, long idleMs, int rawFaceCount, bool? frameIsFresh)
     {
         var obs = PolicyBridge.ClassifyObservation(haveFrame, dark, present);
         if (diagLastObs is null || !obs.Equals(diagLastObs))
@@ -409,24 +431,13 @@ sealed class WatcherContext : ApplicationContext
             Log.Write($"observation: {diagLastObs?.ToString() ?? "(start)"} -> {obs} (idle {idleMs}ms, raw={rawFaceCount} faces)");
             diagLastObs = obs;
         }
-        if (!haveFrame || frameTime is null) return;
-        if (frameTime == diagLastFrameTime)
-        {
-            diagStaleRun++;
-            if (diagStaleRun == 10 && !diagStaleLogged)
-            {
-                diagStaleLogged = true;
-                Log.Write($"frame timestamp frozen for {diagStaleRun} consecutive samples (t={frameTime}) — stale feed suspected");
-            }
-        }
-        else
-        {
-            if (diagStaleLogged)
-                Log.Write($"frame timestamp advancing again after {diagStaleRun} stale samples");
-            diagStaleRun = 0;
-            diagStaleLogged = false;
-            diagLastFrameTime = frameTime;
-        }
+        if (frameIsFresh is null) return;
+        bool stale = !frameIsFresh.Value;
+        if (stale && !diagWasStale)
+            Log.Write($"frame timestamps frozen for >{Core.FreshnessConfig.Default.StaleAfterMs}ms — treating as no-frame");
+        else if (!stale && diagWasStale)
+            Log.Write("frame timestamps advancing again — no longer treating as no-frame");
+        diagWasStale = stale;
     }
 
     async Task SampleAsync()
@@ -444,6 +455,7 @@ sealed class WatcherContext : ApplicationContext
             bool haveFrame = false, present = false, dark = false;
             TimeSpan? frameTime = null;
             int rawFaceCount = 0;
+            bool? frameIsFresh = null;
             if (reader is not null)
             {
                 using var frame = reader.TryAcquireLatestFrame();
@@ -451,23 +463,44 @@ sealed class WatcherContext : ApplicationContext
                 var bitmap = frame?.VideoMediaFrame?.SoftwareBitmap;
                 if (bitmap is not null)
                 {
-                    haveFrame = true;
-                    using var gray = SoftwareBitmap.Convert(bitmap, BitmapPixelFormat.Gray8);
-                    dark = MeanLuma(gray) < cfg.DarkFrameMeanThreshold;
-                    if (!dark)
+                    // Frozen-frame staleness (bug fix): TryAcquireLatestFrame can re-serve a
+                    // cached frame forever (known WinRT quirk). If SystemRelativeTime is
+                    // unavailable, freshness cannot be assessed — frameIsFresh stays null and
+                    // EffectiveHaveFrame's `true` branch below is reached unconditionally,
+                    // matching this code's behavior before FrameFreshness existed.
+                    if (frameTime.HasValue)
                     {
-                        var faces = await detector.DetectFacesAsync(gray);
-                        rawFaceCount = faces.Count;
-                        // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in
-                        // incident 2026-07-28"): stepped here, upstream of ClassifySample and
-                        // Advance, so `present` is the identical stabilized signal every
-                        // downstream consumer observes.
-                        var box = PolicyBridge.LargestFaceBoxNormalized(
-                            faces.Select(f => f.FaceBox).ToList(), (uint)gray.PixelWidth, (uint)gray.PixelHeight);
-                        var filterResult = Core.PresenceFilter.step(Core.FilterConfig.Default, presenceFilterState, box);
-                        presenceFilterState = filterResult.State;
-                        present = filterResult.StablePresence;
+                        var freshness = Core.FrameFreshness.step(
+                            Core.FreshnessConfig.Default, frameFreshnessState,
+                            Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64), frameTime.Value.Ticks);
+                        frameFreshnessState = freshness.State;
+                        frameIsFresh = freshness.IsFresh;
                     }
+                    haveFrame = PolicyBridge.EffectiveHaveFrame(haveFrame: true, frameIsFresh: frameIsFresh ?? true);
+
+                    if (haveFrame)
+                    {
+                        using var gray = SoftwareBitmap.Convert(bitmap, BitmapPixelFormat.Gray8);
+                        dark = MeanLuma(gray) < cfg.DarkFrameMeanThreshold;
+                        if (!dark)
+                        {
+                            var faces = await detector.DetectFacesAsync(gray);
+                            rawFaceCount = faces.Count;
+                            // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in
+                            // incident 2026-07-28"): stepped here, upstream of ClassifySample and
+                            // Advance, so `present` is the identical stabilized signal every
+                            // downstream consumer observes.
+                            var box = PolicyBridge.LargestFaceBoxNormalized(
+                                faces.Select(f => f.FaceBox).ToList(), (uint)gray.PixelWidth, (uint)gray.PixelHeight);
+                            var filterResult = Core.PresenceFilter.step(
+                                Core.FilterConfig.Default, presenceFilterState,
+                                Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64), box);
+                            presenceFilterState = filterResult.State;
+                            present = filterResult.StablePresence;
+                        }
+                    }
+                    // A stale frame (haveFrame now false) falls straight through as
+                    // Observation.NoFrame below — already the correct fail-open path.
                 }
             }
             // `reader is null` here (a cooldown-suppressed CaptureFailed backstop —
@@ -479,7 +512,7 @@ sealed class WatcherContext : ApplicationContext
             long idleMs = InputIdleMs();
             lastObservationDark = dark;
             Core.Event sampleEvent = PolicyBridge.ClassifySample(haveFrame, dark, present, idleMs);
-            LogSensingDiagnostics(haveFrame, dark, present, frameTime, idleMs, rawFaceCount);
+            LogSensingDiagnostics(haveFrame, dark, present, idleMs, rawFaceCount, frameIsFresh);
             Advance(sampleEvent);
         }
         catch (Exception ex)
@@ -511,6 +544,13 @@ sealed class WatcherContext : ApplicationContext
                 // see rfc-core-brain.md's pause/unlock truth table.
                 Advance(Core.Event.SessionUnlocked);
                 if (Core.Policy.status(state).Tag == Core.Status.Tags.Paused) return;
+
+                // Reaching here means the unlock above was not a no-op, so Policy just reset
+                // its own armed/away/signal-health baseline for this unlock — the presence
+                // filter's spatial-coherence run and the freshness tracker's timestamp baseline
+                // must not survive across that same reset.
+                presenceFilterState = Core.PresenceFilter.initial;
+                frameFreshnessState = Core.FrameFreshness.initial;
 
                 if (reader is not null)
                 {
@@ -562,6 +602,11 @@ sealed class WatcherContext : ApplicationContext
         {
             Log.Write("resumed");
             Advance(Core.Event.Resumed);
+            // This branch only runs when actually leaving Paused (the isPaused check above),
+            // so Policy just reset its own baseline for this resume — same parity as the
+            // session-unlock path above.
+            presenceFilterState = Core.PresenceFilter.initial;
+            frameFreshnessState = Core.FrameFreshness.initial;
             if (reader is not null) sampleTimer.Start();
             // KickAcquisitionIfNeeded — second of the three R2-4 call sites.
             KickAcquisitionIfNeeded();

@@ -2,7 +2,11 @@ namespace PresenceLock;
 
 sealed class SettingsForm : Form
 {
-    readonly NumericUpDown away = new() { Minimum = 1, Maximum = 300, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
+    // Minimum = 2: a coarse UI guard consistent with PolicyBridge.BuildPolicyConfig's
+    // away-vs-sample-interval validation floor at the default 500ms sample rate (2000ms ==
+    // FilterConfig.Default.MinCoherentMs + 2 * 500ms) -- prevents the dialog from committing a
+    // value the mapping function would just fall back out of anyway.
+    readonly NumericUpDown away = new() { Minimum = 2, Maximum = 300, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
     readonly NumericUpDown inputIdle = new() { Minimum = 0, Maximum = 600, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
     readonly NumericUpDown grace = new() { Minimum = 0, Maximum = 600, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
     readonly NumericUpDown sampleMs = new() { Minimum = 100, Maximum = 10000, Increment = 100, Width = 80 };
@@ -23,7 +27,7 @@ sealed class SettingsForm : Form
         AutoSizeMode = AutoSizeMode.GrowAndShrink;
         Padding = new Padding(12);
 
-        away.Value = (decimal)Math.Clamp(current.AwayThresholdSeconds, 1, 300);
+        away.Value = (decimal)Math.Clamp(current.AwayThresholdSeconds, 2, 300);
         inputIdle.Value = (decimal)Math.Clamp(current.InputIdleSeconds, 0, 600);
         grace.Value = (decimal)Math.Clamp(current.GraceSeconds, 0, 600);
         sampleMs.Value = Math.Clamp(current.SampleIntervalMs, 100, 10000);

@@ -10,6 +10,7 @@
     <Compile Include="Generators.fs" />
     <Compile Include="Tests.fs" />
     <Compile Include="PresenceFilterTests.fs" />
+    <Compile Include="FrameFreshnessTests.fs" />
   </ItemGroup>
 
   <!--

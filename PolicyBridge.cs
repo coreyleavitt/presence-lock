@@ -35,9 +35,10 @@ static class PolicyBridge
     /// mix (rfc-core-brain.md: "a zero-filled cooldown would make the next camera hiccup an
     /// instant restart loop"). Sensing fields (`CameraNameContains`, `DarkFrameMeanThreshold`,
     /// `SampleIntervalMs`) are untouched by this function and never affected by a policy-field
-    /// failure. Shared by file load and (once the Settings dialog wires it) the commit path,
-    /// per the RFC — same function, so an invalid committed value can never reach `step`
-    /// unvalidated.
+    /// failure — except that `SampleIntervalMs` is read (not written) as one input to the
+    /// away-threshold floor below, the one place a sensing field and a policy field interact.
+    /// Shared by file load and (once the Settings dialog wires it) the commit path, per the
+    /// RFC — same function, so an invalid committed value can never reach `step` unvalidated.
     internal static Core.PolicyConfig BuildPolicyConfig(Config cfg)
     {
         long awayMs = (long)(cfg.AwayThresholdSeconds * 1000);
@@ -50,11 +51,19 @@ static class PolicyBridge
         long recoveryCooldownMs = cfg.RecoveryCooldownMs;
         long upgradeCooldownMs = cfg.UpgradeCooldownMs;
 
+        // Bug fix (false-lock window): worst-case re-stabilization after one dropped detection
+        // is ~one sample gap plus the presence filter's MinCoherentMs dwell. If AwayThresholdMs
+        // could sit below that, a single dropped detection under fast sampling could make the
+        // away clock fire before presence has had a chance to re-stabilize -- a false lock
+        // while the user never left. This makes that emergent interaction impossible by
+        // construction, the same way the other eight fields are validated as a unit.
+        long awayFloorMs = Core.FilterConfig.Default.MinCoherentMs + 2 * cfg.SampleIntervalMs;
+
         bool valid =
             awayMs > 0 && idleMs > 0 && graceMs > 0 &&
             noSignalMs > 0 && reevaluateAfterMs > 0 && reevaluateCooldownMs > 0 &&
             recoveryCooldownMs > 0 && recoveryThreshold >= 1 && upgradeCooldownMs > 0 &&
-            reevaluateAfterMs >= noSignalMs;
+            reevaluateAfterMs >= noSignalMs && awayMs >= awayFloorMs;
 
         if (!valid)
         {
@@ -72,6 +81,57 @@ static class PolicyBridge
             recoveryFailureThreshold: recoveryThreshold,
             recoveryCooldownMs: recoveryCooldownMs,
             upgradeCooldownMs: upgradeCooldownMs);
+    }
+
+    /// The pristine defaults `SanitizeSensingConfig` falls back to, one field at a time — a
+    /// plain `new Config()`, not a hand-duplicated literal, so the fallback values can never
+    /// drift from `Config`'s own field initializers.
+    static readonly Config DefaultSensingConfig = new();
+
+    /// Bug fix (startup crash on a corrupted/hand-edited presencelock.json): `Config.Load()`
+    /// deserialized with no bounds check, and `WinFormsTimer.Interval` throws
+    /// `ArgumentOutOfRangeException` for a `SampleIntervalMs` &lt; 1 — a bad on-disk value could
+    /// kill the app before the tray icon even existed. Each sensing field is validated and
+    /// defaulted independently — deliberately not an all-or-nothing unit like
+    /// `BuildPolicyConfig`'s nine policy fields (rfc-core-brain.md: that unit exists because a
+    /// zero-filled cooldown makes the next camera hiccup an instant restart loop; no such
+    /// cross-field coupling exists between `SampleIntervalMs` and `DarkFrameMeanThreshold`).
+    /// `CameraNameContains` and every policy field pass through untouched — this function is
+    /// sensing-only, the mirror image of `BuildPolicyConfig` reading (never writing) sensing
+    /// fields.
+    internal static Config SanitizeSensingConfig(Config cfg)
+    {
+        int sampleIntervalMs = cfg.SampleIntervalMs;
+        if (sampleIntervalMs < 100 || sampleIntervalMs > 10000)
+        {
+            Log.Write($"config: SampleIntervalMs {sampleIntervalMs} out of range [100, 10000] — " +
+                      $"falling back to default {DefaultSensingConfig.SampleIntervalMs}");
+            sampleIntervalMs = DefaultSensingConfig.SampleIntervalMs;
+        }
+
+        double darkFrameMeanThreshold = cfg.DarkFrameMeanThreshold;
+        if (darkFrameMeanThreshold < 0 || darkFrameMeanThreshold > 255)
+        {
+            Log.Write($"config: DarkFrameMeanThreshold {darkFrameMeanThreshold} out of range [0, 255] — " +
+                      $"falling back to default {DefaultSensingConfig.DarkFrameMeanThreshold}");
+            darkFrameMeanThreshold = DefaultSensingConfig.DarkFrameMeanThreshold;
+        }
+
+        return new Config
+        {
+            AwayThresholdSeconds = cfg.AwayThresholdSeconds,
+            SampleIntervalMs = sampleIntervalMs,
+            GraceSeconds = cfg.GraceSeconds,
+            InputIdleSeconds = cfg.InputIdleSeconds,
+            CameraNameContains = cfg.CameraNameContains,
+            DarkFrameMeanThreshold = darkFrameMeanThreshold,
+            NoSignalReportAfterMs = cfg.NoSignalReportAfterMs,
+            ReevaluateAfterMs = cfg.ReevaluateAfterMs,
+            ReevaluateCooldownMs = cfg.ReevaluateCooldownMs,
+            RecoveryFailureThreshold = cfg.RecoveryFailureThreshold,
+            RecoveryCooldownMs = cfg.RecoveryCooldownMs,
+            UpgradeCooldownMs = cfg.UpgradeCooldownMs,
+        };
     }
 
     /// The real handle-invalid classifier (rfc-core-brain.md, "Notes: recovery boundary" /
@@ -131,6 +191,15 @@ static class PolicyBridge
     /// named in the RFC's slice 8a contract.
     internal static Core.Event ClassifySample(bool haveFrame, bool dark, bool present, long inputIdleMs) =>
         Core.Event.NewSample(ClassifyObservation(haveFrame, dark, present), inputIdleMs);
+
+    /// Bug fix (frozen-frame classification): `TryAcquireLatestFrame` can re-serve a cached
+    /// frame forever (a known WinRT quirk) — a frame whose `Core.FrameFreshness` verdict is
+    /// stale must be classified exactly as if no frame had been acquired at all, not as a live
+    /// (possibly `FaceSeen`) observation. `NoFrame` is already the correct fail-open path: it
+    /// resets the away baseline and accrues the no-signal clock toward the existing
+    /// `NoSignalReportAfter` → `Reevaluate` → process-restart recovery machinery, so this
+    /// collapses to a single boolean AND rather than a new recovery path.
+    internal static bool EffectiveHaveFrame(bool haveFrame, bool frameIsFresh) => haveFrame && frameIsFresh;
 
     /// Picks the largest detected face (by pixel area) and normalizes its bounding box to
     /// [0,1] by the frame's pixel dimensions, for `PresenceLock.Core`'s `PresenceFilter`
