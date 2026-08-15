@@ -142,6 +142,13 @@ sealed class WatcherContext : ApplicationContext
     readonly ToolStripMenuItem pauseItem;
     readonly WinFormsTimer sampleTimer;
     readonly WinFormsTimer retryTimer;
+    // Sampling watchdog (incident 2026-08-12): belt-and-suspenders for the whole sample-
+    // starvation class -- a resume path that fails to restart sampleTimer, or a SampleAsync
+    // pass hung forever with the `sampling` reentrancy guard stuck true. Always running (started
+    // in the constructor, never stopped on pause/lock -- PolicyBridge.ExpectsSampling already
+    // makes those states a no-op inside the pure step), stopped only at process exit alongside
+    // sampleTimer. See lastSamplePassAt/watchdogStrikes below and PolicyBridge.SamplingWatchdogStep.
+    readonly WinFormsTimer watchdogTimer;
     // Camera-arrival upgrade (rfc-core-brain.md addendum 2026-08-01, slice 10): debounces a
     // burst of DeviceWatcher.Added events (a dock enumerates several devices over seconds)
     // into a single would-pick-now check, restarted on every Added event seen after
@@ -161,6 +168,15 @@ sealed class WatcherContext : ApplicationContext
 
     byte[]? lumaBuf;
     bool sampling;
+    // Watchdog stamp (Environment.TickCount64 domain), updated only at the end of a *completed*
+    // SampleAsync pass -- where the `sampling` reentrancy guard is released -- never on the
+    // early guard return that fires while a pass is already in flight. A hung
+    // `await detector.DetectFacesAsync` must starve this stamp so the watchdog notices; a tick
+    // that bounces off the stuck guard must not paper over that by refreshing it anyway.
+    long lastSamplePassAt;
+    // Consecutive starved watchdogTimer ticks since the last self-heal/escalation reset — the
+    // two-strike counter PolicyBridge.SamplingWatchdogStep steps.
+    int watchdogStrikes;
     bool starting;
     bool settingsOpen;
     // The shell's own current-sample dark-vs-no-frame knowledge (rfc-core-brain.md:
@@ -242,6 +258,39 @@ sealed class WatcherContext : ApplicationContext
             if (reader is null && PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state)))
                 await StartWatchingAsync();
         };
+
+        // Sampling watchdog (incident 2026-08-12) — see the field comment above and
+        // PolicyBridge.SamplingWatchdogStep for the pure step this drives. Starts immediately
+        // and always running: PolicyBridge.ExpectsSampling already makes paused/locked/acquiring
+        // states a no-op inside the pure step, so there is no state in which this timer itself
+        // needs to be stopped short of process exit.
+        lastSamplePassAt = Environment.TickCount64;
+        watchdogTimer = new WinFormsTimer { Interval = 5000 };
+        watchdogTimer.Tick += (_, _) =>
+        {
+            // Live from cfg (not captured once) so a Settings change to SampleIntervalMs is
+            // picked up on the very next tick.
+            long starvationMs = Math.Max(10L * cfg.SampleIntervalMs, 15000);
+            var verdict = PolicyBridge.SamplingWatchdogStep(
+                expectsSampling: PolicyBridge.ExpectsSampling(Core.Policy.status(state)),
+                nowMs: Environment.TickCount64,
+                lastSamplePassMs: lastSamplePassAt,
+                strikes: watchdogStrikes,
+                starvationMs: starvationMs);
+            watchdogStrikes = verdict.Strikes;
+            lastSamplePassAt = verdict.StampMs;
+            if (verdict.StartSampleTimer)
+            {
+                Log.Write($"sampling watchdog: no completed sample pass for {starvationMs}ms — restarting sample timer");
+                sampleTimer.Start(); // idempotent if already running
+            }
+            else if (verdict.TreatAsCaptureFailed)
+            {
+                Log.Write("sampling watchdog: still starved after self-heal — treating as capture failure");
+                if (Advance(Core.Event.CaptureFailed)) return; // Action.Restart executed — process exiting
+            }
+        };
+        watchdogTimer.Start();
 
         SystemEvents.SessionSwitch += OnSessionSwitch;
 
@@ -507,7 +556,9 @@ sealed class WatcherContext : ApplicationContext
             // rfc-core-brain.md, "Notes: recovery boundary") falls straight through as
             // haveFrame=false, i.e. Observation.NoFrame — the shell keeps sampleTimer running
             // so the NoFrame → re-evaluation backstop engages on the ordinary signal-health path,
-            // with no separate mechanism.
+            // with no separate mechanism. Every resume path now guarantees sampleTimer is running
+            // whenever this branch can be reached (incident 2026-08-12) — see OnSessionSwitch's
+            // unlock branch and TogglePause's resume branch.
 
             long idleMs = InputIdleMs();
             lastObservationDark = dark;
@@ -521,6 +572,11 @@ sealed class WatcherContext : ApplicationContext
         }
         finally
         {
+            // Watchdog stamp — see the field comment on lastSamplePassAt: updated here, at the
+            // guard's release, and nowhere else. A pass that hung inside the try block above
+            // (e.g. a stuck detector.DetectFacesAsync) never reaches this finally until it
+            // returns, so the stamp starves correctly for as long as the hang lasts.
+            lastSamplePassAt = Environment.TickCount64;
             sampling = false;
         }
     }
@@ -552,6 +608,13 @@ sealed class WatcherContext : ApplicationContext
                 presenceFilterState = Core.PresenceFilter.initial;
                 frameFreshnessState = Core.FrameFreshness.initial;
 
+                // Resume paths always restart sampling (incident 2026-08-12), regardless of
+                // whether a camera is currently attached: the null-reader branch of SampleAsync
+                // exists precisely so a dead-camera state still emits NoFrame and drives the
+                // ordinary no-signal -> reevaluate -> restart recovery. A resume that only
+                // restarted the timer when reader was non-null left sampling permanently
+                // stopped whenever the camera died while paused/locked -- unpaused, reader
+                // null, timer stopped, no recovery possible.
                 if (reader is not null)
                 {
                     // The camera deliberately stays alive across the lock: on this machine,
@@ -559,8 +622,12 @@ sealed class WatcherContext : ApplicationContext
                     // service itself (persistent E_HANDLE for every process until an elevated
                     // service restart). Initialize once, never re-initialize.
                     Log.Write("resumed after unlock (camera kept alive)");
-                    sampleTimer.Start();
                 }
+                else
+                {
+                    Log.Write("resumed after unlock (no camera — sampling resumes for signal-driven recovery)");
+                }
+                sampleTimer.Start();
                 // KickAcquisitionIfNeeded (rfc-core-brain.md R2-4) — one of the three call
                 // sites sharing the core-owned status gate: names the mechanism today's code
                 // implements as a direct StartWatchingAsync() call, so the self-stopping retry
@@ -584,7 +651,12 @@ sealed class WatcherContext : ApplicationContext
             if (Advance(Core.Event.CaptureFailed)) return; // Action.Restart executed — process exiting
             // Cooldown-suppressed backstop: tear down the dead capture (reader null) but keep
             // sampleTimer running — SampleAsync's null-reader path emits NoFrame, and the
-            // ordinary signal-health machinery carries the rest (no new mechanism).
+            // ordinary signal-health machinery carries the rest (no new mechanism). Every resume
+            // path (TogglePause, OnSessionSwitch unlock) now starts sampleTimer unconditionally,
+            // even when reader is null (incident 2026-08-12), so this backstop can no longer be
+            // stranded by a pause/lock that happens to land inside the restart cooldown. The
+            // sampling watchdog below is the second line of defense for any other starvation path
+            // (e.g. a hung SampleAsync pass) this comment doesn't cover.
             TeardownCamera();
         }, null);
 
@@ -607,7 +679,11 @@ sealed class WatcherContext : ApplicationContext
             // session-unlock path above.
             presenceFilterState = Core.PresenceFilter.initial;
             frameFreshnessState = Core.FrameFreshness.initial;
-            if (reader is not null) sampleTimer.Start();
+            // Resume paths always restart sampling (incident 2026-08-12) -- see the identical
+            // comment in OnSessionSwitch's unlock branch. A reader-null resume still needs
+            // sampling running: SampleAsync's null-reader path emits NoFrame, which is what
+            // drives recovery when a camera died while paused.
+            sampleTimer.Start();
             // KickAcquisitionIfNeeded — second of the three R2-4 call sites.
             KickAcquisitionIfNeeded();
         }
@@ -912,6 +988,7 @@ sealed class WatcherContext : ApplicationContext
     {
         SystemEvents.SessionSwitch -= OnSessionSwitch;
         sampleTimer.Stop();
+        watchdogTimer.Stop();
         retryTimer.Stop();
         deviceSettleTimer.Stop();
         try { deviceWatcher.Stop(); } catch (Exception ex) { Log.Write($"device watcher stop: {ex.Message}"); }

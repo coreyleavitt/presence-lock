@@ -449,6 +449,123 @@ public class IsAcquiringOrRecoveringTests
     }
 }
 
+/// Sampling watchdog gate (incident 2026-08-12): true exactly for the statuses where sample
+/// events should be flowing (Watching/NoSignal). False for Paused/SessionLocked (sampling is
+/// deliberately stopped) and AcquiringCamera/Recovering (pre-first-success acquisition is the
+/// retry timer's job, not the sample timer's).
+public class ExpectsSamplingTests
+{
+    [Fact]
+    public void Watching_and_NoSignal_expect_sampling()
+    {
+        Assert.True(PolicyBridge.ExpectsSampling(Core.Status.Watching));
+        Assert.True(PolicyBridge.ExpectsSampling(Core.Status.NoSignal));
+    }
+
+    [Fact]
+    public void Paused_and_SessionLocked_do_not_expect_sampling()
+    {
+        Assert.False(PolicyBridge.ExpectsSampling(Core.Status.Paused));
+        Assert.False(PolicyBridge.ExpectsSampling(Core.Status.SessionLocked));
+    }
+
+    [Fact]
+    public void AcquiringCamera_and_Recovering_do_not_expect_sampling()
+    {
+        Assert.False(PolicyBridge.ExpectsSampling(Core.Status.AcquiringCamera));
+        Assert.False(PolicyBridge.ExpectsSampling(Core.Status.Recovering));
+    }
+}
+
+/// The sampling watchdog's pure two-strike step function (incident 2026-08-12): belt-and-
+/// suspenders for the whole starvation class (a resume path that fails to restart sampleTimer,
+/// or a SampleAsync pass hung forever leaving the `sampling` reentrancy guard stuck true). A
+/// cheap self-heal (restart the sample timer) on the first starved check after entering a
+/// sampling status, escalating to a `CaptureFailed`-shaped restart request only if starvation
+/// persists past a second consecutive check — so a transient stall self-heals silently and only
+/// a truly wedged pipeline reaches the core's existing cooldown-gated restart machinery.
+public class SamplingWatchdogStepTests
+{
+    const long StarvationMs = 15000;
+
+    [Fact]
+    public void Not_expecting_sampling_resets_strikes_and_refreshes_the_stamp_to_now()
+    {
+        // Paused/locked/acquiring time never counts as starvation, and the first check after
+        // re-entering a sampling status must measure from ~now, not from a stamp stale from
+        // before the non-sampling interval (this is what absorbs a sleep/wake gap while paused).
+        var verdict = PolicyBridge.SamplingWatchdogStep(
+            expectsSampling: false, nowMs: 100_000, lastSamplePassMs: 1_000, strikes: 2, starvationMs: StarvationMs);
+
+        Assert.Equal(0, verdict.Strikes);
+        Assert.Equal(100_000, verdict.StampMs);
+        Assert.False(verdict.StartSampleTimer);
+        Assert.False(verdict.TreatAsCaptureFailed);
+    }
+
+    [Fact]
+    public void Expecting_sampling_and_not_yet_starved_takes_no_action_and_leaves_the_stamp_unchanged()
+    {
+        var verdict = PolicyBridge.SamplingWatchdogStep(
+            expectsSampling: true, nowMs: 10_000, lastSamplePassMs: 1_000, strikes: 0, starvationMs: StarvationMs);
+
+        Assert.Equal(0, verdict.Strikes);
+        Assert.Equal(1_000, verdict.StampMs);
+        Assert.False(verdict.StartSampleTimer);
+        Assert.False(verdict.TreatAsCaptureFailed);
+    }
+
+    [Fact]
+    public void First_starved_check_self_heals_by_starting_the_sample_timer()
+    {
+        var verdict = PolicyBridge.SamplingWatchdogStep(
+            expectsSampling: true, nowMs: 20_000, lastSamplePassMs: 1_000, strikes: 0, starvationMs: StarvationMs);
+
+        Assert.Equal(1, verdict.Strikes);
+        Assert.Equal(20_000, verdict.StampMs);
+        Assert.True(verdict.StartSampleTimer);
+        Assert.False(verdict.TreatAsCaptureFailed);
+    }
+
+    [Fact]
+    public void Second_consecutive_starved_check_escalates_to_capture_failed_and_resets_strikes()
+    {
+        var verdict = PolicyBridge.SamplingWatchdogStep(
+            expectsSampling: true, nowMs: 40_000, lastSamplePassMs: 20_000, strikes: 1, starvationMs: StarvationMs);
+
+        Assert.Equal(0, verdict.Strikes);
+        Assert.Equal(40_000, verdict.StampMs);
+        Assert.False(verdict.StartSampleTimer);
+        Assert.True(verdict.TreatAsCaptureFailed);
+    }
+
+    [Fact]
+    public void A_healthy_pass_observed_between_strikes_resets_the_strike_count()
+    {
+        // strikes=1 carried in, but this check is not starved -- a completed sample pass landed
+        // between the first strike and this check, so escalation must not fire next time either.
+        var verdict = PolicyBridge.SamplingWatchdogStep(
+            expectsSampling: true, nowMs: 21_000, lastSamplePassMs: 20_000, strikes: 1, starvationMs: StarvationMs);
+
+        Assert.Equal(0, verdict.Strikes);
+        Assert.False(verdict.TreatAsCaptureFailed);
+    }
+
+    [Fact]
+    public void Repeated_starvation_alternates_self_heal_then_escalate_across_consecutive_checks()
+    {
+        var first = PolicyBridge.SamplingWatchdogStep(
+            expectsSampling: true, nowMs: 20_000, lastSamplePassMs: 1_000, strikes: 0, starvationMs: StarvationMs);
+        Assert.True(first.StartSampleTimer);
+        Assert.Equal(1, first.Strikes);
+
+        var second = PolicyBridge.SamplingWatchdogStep(
+            expectsSampling: true, nowMs: 40_000, lastSamplePassMs: first.StampMs, strikes: first.Strikes, starvationMs: StarvationMs);
+        Assert.True(second.TreatAsCaptureFailed);
+        Assert.Equal(0, second.Strikes);
+    }
+}
+
 /// The camera preference ranking (rfc-core-brain.md addendum 2026-08-01, slice 10:
 /// camera-arrival upgrade), factored out of InitCameraAsync's original inline selection so
 /// startup selection and the arrival-triggered device watcher share one implementation. These

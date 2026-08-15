@@ -70,6 +70,31 @@ unit- and property-testable.
   executed as a graceful process self-restart by the shell. Do not add a teardown/retry
   loop, however tempting — first-init in a fresh process is the only reliable
   re-initialization on affected hardware.
+- **Resume always restarts sampling.** Every path that leaves `Paused`/`SessionLocked`
+  (`TogglePause`'s resume branch, `OnSessionSwitch`'s unlock branch) restarts the sample
+  timer unconditionally, whether or not a camera is currently attached. This closes an
+  incident (2026-08-12) where a resume gated the restart on `reader is not null`: a
+  camera that died — inside the restart cooldown, while the process was paused — left
+  the reader null and the sample timer stopped with no path back. The dead-camera
+  branch of `SampleAsync` exists precisely for this state: with `reader` null it still
+  emits `NoFrame`, which drives the ordinary no-signal → re-evaluation → restart
+  recovery — resuming sampling is what lets that branch run at all.
+- **A sampling watchdog guards against sample-timer starvation more generally.** Belt-
+  and-suspenders for the rest of the starvation class beyond the specific incident above
+  — a wiring hole in some other resume/init path, or a `SampleAsync` pass hung inside
+  `await detector.DetectFacesAsync` with its reentrancy guard stuck true. A timer,
+  independent of `sampleTimer` and always running, checks on a fixed interval whether a
+  sample pass has completed recently while `PolicyBridge.ExpectsSampling` says one
+  should have (`Watching`/`NoSignal` only — paused/locked/pre-acquisition states are
+  never starvation, by construction). The check and its two-strike escalation
+  (`PolicyBridge.SamplingWatchdogStep`) are pure and unit-tested: the first starved
+  check performs a cheap self-heal (restart the sample timer, idempotent if it is
+  already running); only a second consecutive starved check — meaning the self-heal
+  did not clear it — is treated as a capture failure and fed through the normal
+  `Advance(Event.CaptureFailed)` chokepoint. That routes through the core's existing,
+  cooldown-gated recovery restart (`RecoveryCooldownMs`), so a genuinely wedged
+  pipeline converges to one restart per cooldown window rather than a storm, and the
+  watchdog introduces no restart authority of its own.
 - **Camera switching is a process handoff.** Each process initializes exactly one
   camera, exactly once. Losing the camera (undocking) surfaces as a capture failure
   and restarts onto the best remaining device; a *better* camera arriving (docking)

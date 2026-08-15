@@ -157,6 +157,70 @@ static class PolicyBridge
     internal static bool IsAcquiringOrRecovering(Core.Status status) =>
         status.Tag == Core.Status.Tags.AcquiringCamera || status.Tag == Core.Status.Tags.Recovering;
 
+    /// The sampling watchdog's status gate (incident 2026-08-12: a resume path that only
+    /// restarted `sampleTimer` when `reader is not null` left it permanently stopped after a
+    /// camera died inside the restart cooldown while paused). True exactly for the statuses
+    /// where sample events should be flowing — `Watching`/`NoSignal` — so `Paused`/
+    /// `SessionLocked` (sampling deliberately stopped) and `AcquiringCamera`/`Recovering`
+    /// (pre-first-success acquisition is the retry timer's job, not the sample timer's) never
+    /// count as starvation. Paired with `SamplingWatchdogStep`.
+    internal static bool ExpectsSampling(Core.Status status) => status.Tag switch
+    {
+        Core.Status.Tags.Watching => true,
+        Core.Status.Tags.NoSignal => true,
+        Core.Status.Tags.SessionLocked => false,
+        Core.Status.Tags.Paused => false,
+        Core.Status.Tags.AcquiringCamera => false,
+        Core.Status.Tags.Recovering => false,
+        _ => throw new UnreachableException(),
+    };
+
+    /// Verdict of one `SamplingWatchdogStep` evaluation: `Strikes`/`StampMs` are the caller's
+    /// next `watchdogStrikes`/`lastSamplePassAt` (a plain replace, never a merge); `StartSampleTimer`
+    /// and `TreatAsCaptureFailed` are mutually exclusive one-shot actions for this tick only —
+    /// never both true, and both false on every non-escalating branch.
+    internal readonly record struct WatchdogVerdict(int Strikes, long StampMs, bool StartSampleTimer, bool TreatAsCaptureFailed);
+
+    /// The sampling watchdog's pure two-strike escalation (incident 2026-08-12: a resume path
+    /// that only restarted `sampleTimer` when `reader is not null` left sampling permanently
+    /// stopped after a camera died inside the restart cooldown while paused). Belt-and-
+    /// suspenders for the whole starvation class, including a `SampleAsync` pass hung forever in
+    /// `await detector.DetectFacesAsync` with the `sampling` reentrancy guard stuck true — a
+    /// stuck guard starves `lastSamplePassMs` exactly like a stopped timer, since the caller only
+    /// advances that stamp when a pass actually completes.
+    ///
+    /// `!expectsSampling`: paused/locked/acquiring time never counts as starvation, and
+    /// refreshing the stamp to `nowMs` makes the first check after re-entering a sampling status
+    /// measure from ~now — this is also what absorbs a sleep/wake gap while paused, with no
+    /// separate wake-detection mechanism.
+    ///
+    /// First starved check (`strikes == 0`): a cheap self-heal — request `sampleTimer.Start()`
+    /// (idempotent if already running) and refresh the stamp, so the next evaluation measures the
+    /// self-heal's own effect. A post-sleep monotonic gap costs one harmless self-heal rather than
+    /// a spurious restart.
+    ///
+    /// Second consecutive starved check (`strikes >= 1`): the self-heal did not clear the
+    /// starvation, so request capture-failed treatment instead. The caller feeds
+    /// `Core.Event.CaptureFailed` through `Advance` — the core's existing flagless
+    /// capture-failure handling gates the resulting restart on `RecoveryCooldownMs`, so repeated
+    /// watchdog fires while truly stuck converge to one restart per cooldown window, never a
+    /// storm. This introduces no new restart authority; it only feeds the one that already exists.
+    internal static WatchdogVerdict SamplingWatchdogStep(
+        bool expectsSampling, long nowMs, long lastSamplePassMs, int strikes, long starvationMs)
+    {
+        if (!expectsSampling)
+            return new WatchdogVerdict(Strikes: 0, StampMs: nowMs, StartSampleTimer: false, TreatAsCaptureFailed: false);
+
+        bool starved = nowMs - lastSamplePassMs >= starvationMs;
+        if (!starved)
+            return new WatchdogVerdict(Strikes: 0, StampMs: lastSamplePassMs, StartSampleTimer: false, TreatAsCaptureFailed: false);
+
+        if (strikes == 0)
+            return new WatchdogVerdict(Strikes: 1, StampMs: nowMs, StartSampleTimer: true, TreatAsCaptureFailed: false);
+
+        return new WatchdogVerdict(Strikes: 0, StampMs: nowMs, StartSampleTimer: false, TreatAsCaptureFailed: true);
+    }
+
     /// Status → tray/status-text mapping (rfc-core-brain.md, slice 8b deliverable: "Status →
     /// tray/log mapping table implemented as a single function"). `lastObservationDark` is the
     /// shell's own current-sample dark-vs-no-frame knowledge (Core's `Status.NoSignal` does not
