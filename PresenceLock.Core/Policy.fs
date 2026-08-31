@@ -17,6 +17,15 @@ module Policy =
           Armed = false
           IsPaused = false
           IsSessionLocked = false
+          // Old path never reads LastInputs — an all-false/0 instance, never inference from
+          // a struct default (RFC 0002-environment-levels' Construction discipline is what
+          // makes StepInputs a reference type in the first place; this literal instance is
+          // unrelated to that hazard since nothing here reads it).
+          LastInputs =
+            { SessionLocked = false
+              Paused = false
+              LockInhibited = false
+              InputIdleMs = 0L }
           GraceBaselineAt = now
           AwayBaselineAt = now
           BadSignalSince = None
@@ -24,6 +33,36 @@ module Policy =
           // Fresh state, pre-first-event: not paused, not locked, no failure yet, no success
           // yet — priority row 4 (Status priority table, 0001-core-brain.md "Notes").
           CachedStatus = Status.AcquiringCamera }
+
+    /// Levels-path counterpart of `start` (RFC 0002-environment-levels): takes the initial
+    /// `StepInputs` the shell sampled before acquisition begins (WTS query + pause consume-
+    /// and-clear complete first — restart pause-inheritance becomes ordinary input passing).
+    /// `LastInputs` is initialized to `inputs` VERBATIM — pinned, not left to inference: the
+    /// suppression-edge rule's first-call correctness depends on it, since any other initial
+    /// value (a default reads "unsuppressed") would make `suppressed LastInputs` false on a
+    /// restart-while-locked process and silently skip the baseline reset on the first real
+    /// unlock it observes. The initial `CachedStatus` is likewise computed from `inputs`
+    /// directly (rows 1-2 of the priority table) rather than via `computeLevelsStatus`: pre-
+    /// first-event, `InitFailStreak` is always 0 and `HasSucceededOnce` is always false, so
+    /// rows 3/5/6 can never apply and no `PolicyConfig` is needed — matching `start`'s
+    /// no-`PolicyConfig` signature. A restart-while-paused process therefore reports `Paused`
+    /// from its very first render, never a one-frame `AcquiringCamera` flash.
+    let startLevels (now: MonotonicMs, stamps: RestartStamps, inputs: StepInputs) : State =
+        let initialStatus =
+            if inputs.Paused then Status.Paused
+            elif inputs.SessionLocked then Status.SessionLocked
+            else Status.AcquiringCamera
+        { HasSucceededOnce = false
+          InitFailStreak = 0
+          Armed = false
+          IsPaused = false
+          IsSessionLocked = false
+          LastInputs = inputs
+          GraceBaselineAt = now
+          AwayBaselineAt = now
+          BadSignalSince = None
+          Stamps = stamps
+          CachedStatus = initialStatus }
 
     /// Total, priority-ordered `State -> Status` projection (0001-core-brain.md, the Status
     /// priority table in "Notes"). `PolicyConfig`/`now` are needed only for row 5 (`NoSignal`):
@@ -53,6 +92,39 @@ module Policy =
     /// even when no other field changed (slice 4).
     let private withRecomputedStatus (config: PolicyConfig, now: MonotonicMs) (state: State) : State =
         { state with CachedStatus = computeStatus (config, state, now) }
+
+    /// Levels-path counterpart of `computeStatus` (RFC 0002-environment-levels, "Status"):
+    /// the same six-case priority table, but rows 1-2 read `state.LastInputs` instead of the
+    /// deleted folded `IsPaused`/`IsSessionLocked` flags. Rows 3-6 are unchanged. Called only
+    /// from `stepLevels`'s tail (after `LastInputs` has already been overwritten with the
+    /// current call's inputs) and from `startLevels` (pre-first-event, where rows 3/5/6 can
+    /// never apply since `InitFailStreak` is always 0 and `HasSucceededOnce` is always false).
+    let private computeLevelsStatus (config: PolicyConfig, state: State, now: MonotonicMs) : Status =
+        let inputs = state.LastInputs
+        if inputs.Paused then
+            Status.Paused
+        elif inputs.SessionLocked then
+            Status.SessionLocked
+        elif not state.HasSucceededOnce then
+            if state.InitFailStreak >= 1 then Status.Recovering else Status.AcquiringCamera
+        else
+            let (MonotonicMs nowMs) = now
+            let badSignalForMs =
+                match state.BadSignalSince with
+                | None -> 0L
+                | Some (MonotonicMs sinceMs) -> nowMs - sinceMs
+            if badSignalForMs >= config.NoSignalReportAfterMs then
+                Status.NoSignal
+            else
+                Status.Watching
+
+    let private withRecomputedLevelsStatus (config: PolicyConfig, now: MonotonicMs) (state: State) : State =
+        { state with CachedStatus = computeLevelsStatus (config, state, now) }
+
+    /// `suppressed inputs = inputs.SessionLocked || inputs.Paused` (RFC 0002-environment-
+    /// levels, "Suppression and the single edge rule") — the entire former truth table
+    /// collapses into this one predicate plus the edge rule in `stepLevels`.
+    let private suppressed (inputs: StepInputs) : bool = inputs.SessionLocked || inputs.Paused
 
     /// Wall-clock cooldown check shared by both restart reasons (slice 4 introduces the first
     /// use, for `ReevaluateCooldownMs`; slice 6's recovery streak reuses this same idiom for
@@ -93,6 +165,157 @@ module Policy =
             GraceBaselineAt = now
             AwayBaselineAt = now
             BadSignalSince = None }
+
+    /// Per-event match for the levels path (RFC 0002-environment-levels, "Suppression and the
+    /// single edge rule"). Fully suppression-blind: never reads `LastInputs`/suppression and
+    /// never writes `LastInputs`/`CachedStatus` — both are wrapper-owned by `stepLevels`'s
+    /// single tail, which is thereby the only writer of `LastInputs` and the only caller of
+    /// status computation. This is deliberately NOT a drop-in port of `step`'s per-event
+    /// match: the `when state.IsPaused || state.IsSessionLocked` guard on the `Sample` arms
+    /// is deleted, not ported (the wrapper's while-suppressed no-op subsumes it), idle is
+    /// read from `ctx.Inputs.InputIdleMs` rather than the `Sample` payload's `inputIdleMs`
+    /// (the payload is ignored here, kept only so the `Event` shape stays shared with the old
+    /// path this slice), and the four legacy session/pause events become decision-state
+    /// no-ops — transitional arms, deleted outright once the shell migration removes the
+    /// events themselves from `Event`. Failure/restart events (`InitFailed`, `CaptureFailed`,
+    /// `BetterCameraAvailable`) are ported unchanged: they were already pause-immune
+    /// (0001-core-brain.md R2-10), i.e. already suppression-blind, so they need no adaptation.
+    let private dispatch (config: PolicyConfig, state: State, ctx: StepContext, event: Event) : StepResult =
+        let now = ctx.Now
+        let nowWall = ctx.NowWall
+        match event with
+        | Event.Sample(Observation.FaceSeen, _inputIdleMs) ->
+            let updated =
+                { state with
+                    Armed = true
+                    AwayBaselineAt = now
+                    BadSignalSince = None }
+            { State = updated; Action = Action.NoAction }
+        | Event.Sample(Observation.NoFace, _inputIdleMs) ->
+            let updated = { state with BadSignalSince = None }
+            let (MonotonicMs nowMs) = now
+            let (MonotonicMs graceBaselineMs) = updated.GraceBaselineAt
+            let (MonotonicMs awayBaselineMs) = updated.AwayBaselineAt
+            let outOfGrace = nowMs - graceBaselineMs >= config.GraceMs
+            let awaySatisfied = nowMs - awayBaselineMs >= config.AwayThresholdMs
+            let idleSatisfied = ctx.Inputs.InputIdleMs >= config.InputIdleRequiredMs
+            let action =
+                if updated.Armed && outOfGrace && awaySatisfied && idleSatisfied then
+                    Action.Lock
+                else
+                    Action.NoAction
+            { State = updated; Action = action }
+        | Event.Sample((Observation.NoFrame | Observation.DarkFrame), _inputIdleMs) ->
+            let badSignalSince =
+                match state.BadSignalSince with
+                | Some since -> since
+                | None -> now
+            let (MonotonicMs nowMs) = now
+            let (MonotonicMs sinceMs) = badSignalSince
+            let badSignalForMs = nowMs - sinceMs
+            let (WallClockMs nowWallMs) = nowWall
+            let reevaluateDue =
+                badSignalForMs >= config.ReevaluateAfterMs
+                && cooldownElapsed (nowWallMs, config.ReevaluateCooldownMs, state.Stamps.ReevalAt)
+            let stamps =
+                if reevaluateDue then
+                    { state.Stamps with ReevalAt = System.Nullable(nowWallMs) }
+                else
+                    state.Stamps
+            let updated =
+                { state with
+                    AwayBaselineAt = now
+                    BadSignalSince = Some badSignalSince
+                    Stamps = stamps }
+            let action =
+                if reevaluateDue then
+                    Action.Restart RestartReason.CameraReevaluation
+                else
+                    Action.NoAction
+            { State = updated; Action = action }
+        | Event.InitSucceeded ->
+            let updated =
+                { state with
+                    Armed = false
+                    GraceBaselineAt = now
+                    AwayBaselineAt = now
+                    BadSignalSince = None
+                    HasSucceededOnce = true
+                    InitFailStreak = 0 }
+            { State = updated; Action = Action.NoAction }
+        | Event.InitFailed handleInvalid ->
+            let streak = state.InitFailStreak + 1
+            let (WallClockMs nowWallMs) = nowWall
+            let wantsRestart = handleInvalid && streak >= config.RecoveryFailureThreshold
+            let stamps, restartDue =
+                requestWedgeRestart (nowWallMs, config.RecoveryCooldownMs, state.Stamps, wantsRestart)
+            let updated = { state with InitFailStreak = streak; Stamps = stamps }
+            let action = if restartDue then Action.Restart RestartReason.CameraWedged else Action.NoAction
+            { State = updated; Action = action }
+        | Event.CaptureFailed ->
+            if not state.HasSucceededOnce then
+                { State = state; Action = Action.NoAction }
+            else
+                let (WallClockMs nowWallMs) = nowWall
+                let stamps, restartDue =
+                    requestWedgeRestart (nowWallMs, config.RecoveryCooldownMs, state.Stamps, true)
+                let updated = { state with Stamps = stamps }
+                let action = if restartDue then Action.Restart RestartReason.CameraWedged else Action.NoAction
+                { State = updated; Action = action }
+        | Event.BetterCameraAvailable ->
+            if not state.HasSucceededOnce then
+                { State = state; Action = Action.NoAction }
+            else
+                let (WallClockMs nowWallMs) = nowWall
+                let upgradeDue = cooldownElapsed (nowWallMs, config.UpgradeCooldownMs, state.Stamps.UpgradeAt)
+                let stamps =
+                    if upgradeDue then
+                        { state.Stamps with UpgradeAt = System.Nullable(nowWallMs) }
+                    else
+                        state.Stamps
+                let updated = { state with Stamps = stamps }
+                let action = if upgradeDue then Action.Restart RestartReason.CameraUpgrade else Action.NoAction
+                { State = updated; Action = action }
+        | Event.Reconcile
+        | Event.SessionLocked
+        | Event.SessionUnlocked
+        | Event.Paused
+        | Event.Resumed ->
+            // Reconcile: no decision-state change, no Action -- the wrapper's edge rule plus
+            // tail is its entire effect (Event.Reconcile's doc comment in Types.fs); never
+            // emits Lock, since a lock decision needs a current observation and Reconcile
+            // carries none. Legacy session/pause events: decision-state no-ops in the levels
+            // path, transitional only -- suppression is now derived from StepInputs, not from
+            // these events, so they carry no levels-path meaning.
+            { State = state; Action = Action.NoAction }
+
+    /// Levels-path step (RFC 0002-environment-levels, "Suppression and the single edge
+    /// rule"): a thin wrapper composing (1) suppression-edge derivation and baseline reset,
+    /// (2) the while-suppressed `Sample` no-op (hoisted out of the per-event match so
+    /// `dispatch` is fully suppression-blind), (3) suppression-blind `dispatch`, (4) a single
+    /// tail that is the only writer of `LastInputs` and the only caller of levels-status
+    /// computation. This is what makes the edge rule sound: every call -- every event,
+    /// suppressed or not, no-op or not -- ends by recording the current inputs into
+    /// `LastInputs` and recomputing `CachedStatus`, so an edge can be delayed by at most one
+    /// call, never lost, because both sides of the `suppressed` comparison are re-supplied
+    /// fresh on every call.
+    let stepLevels (config: PolicyConfig, state: State, ctx: StepContext, event: Event) : StepResult =
+        let edge = suppressed state.LastInputs && not (suppressed ctx.Inputs)
+        let state' = if edge then applyBaselineReset ctx.Now state else state
+        let result =
+            match event with
+            | Event.Sample _ when suppressed ctx.Inputs -> { State = state'; Action = Action.NoAction }
+            | _ -> dispatch (config, state', ctx, event)
+        { result with
+            State =
+                { result.State with LastInputs = ctx.Inputs }
+                |> withRecomputedLevelsStatus (config, ctx.Now) }
+
+    /// = `LastInputs.LockInhibited` as of the most recent `stepLevels` call; cached like
+    /// `Status` (RFC 0002-environment-levels, "Status"). The fire-time lock GATE itself is a
+    /// later slice -- this slice only carries and projects the field, exactly as pinned:
+    /// `LockInhibited` never influences any decision here.
+    let lockInhibited (state: State) : bool = state.LastInputs.LockInhibited
 
     /// `step` for `Sample`/`InitSucceeded` — the slice-3 lock decision, plus slice 4's signal
     /// accounting for `NoFrame`/`DarkFrame` — plus slice 5's session/pause re-baselining. The
