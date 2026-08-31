@@ -6,7 +6,7 @@
     Do not add RuntimeIdentifier(s), SelfContained, or a Windows-flavored TFM here — the
     win-x64 self-contained publish of PresenceLock.csproj (the WinExe host) resolves this
     plain net10.0 ProjectReference as-is; RID/TFM settings added "defensively" would
-    undermine the testable-anywhere goal (rfc-core-brain.md, slice 1).
+    undermine the testable-anywhere goal (0001-core-brain.md, slice 1).
   -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>

@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    Shell-side xunit tests for the pure helpers extracted in rfc-core-brain.md slice 8a
+    Shell-side xunit tests for the pure helpers extracted in 0001-core-brain.md slice 8a
     (PolicyBridge: config mapping, IsHandleInvalid classifier, restart-stamps reader,
     Sample event construction) — see R2-7 and the "Config" section's test requirements.
     Same Windows TFM as PresenceLock.csproj since it references it; nothing here touches a

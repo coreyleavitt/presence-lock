@@ -2,7 +2,7 @@ namespace PresenceLock.Core
 
 open System
 
-/// Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
+/// Presence-stabilization filter (0001-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
 /// Windows' `FaceDetector` produces threshold-flicker false positives on an empty scene under a
 /// hunting auto-framing crop — a single stray `FaceSeen` reset `Policy`'s away clock, so the app
 /// never locked. Absence already integrates over `AwayThresholdMs`; presence previously flipped
@@ -41,7 +41,7 @@ type FaceBox =
 /// `MaintainIoU` — deliberately looser — gates a run that has already reached stability once
 /// (Schmitt-trigger hysteresis: established presence is sticky against IoU jitter from a
 /// hunting auto-framing crop or a slight head turn, without loosening the initial acquisition
-/// bar). No on-disk schema for these yet (rfc-core-brain.handoff.md, burn-in incident note:
+/// bar). No on-disk schema for these yet (0001-core-brain.handoff.md, burn-in incident note:
 /// "no json/schema changes — defaults only for now") — `Default` is the only value the shell
 /// wires in.
 type FilterConfig =

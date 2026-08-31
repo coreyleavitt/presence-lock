@@ -141,7 +141,7 @@ let ``never-seen must not lock, even when away/idle/grace are all satisfied`` ()
 // --- Slice 4: signal accounting (NoFrame/DarkFrame) -------------------------------------
 
 /// Shared body for the fail-open away-baseline-reset scenario, run against both bad-signal
-/// observations (rfc-core-brain.md: "NoFrame and DarkFrame observations reset the away-
+/// observations (0001-core-brain.md: "NoFrame and DarkFrame observations reset the away-
 /// baseline identically to FaceSeen ... but, unlike FaceSeen, do not set armed").
 let private assertBadSignalResetsAwayClockWithoutArming (badObservation: Observation) =
     let state = Policy.start (MonotonicMs 0L, noStamps)
@@ -465,7 +465,7 @@ let ``pause takes precedence over an unlock-driven resume: SessionUnlocked while
 
 [<Fact>]
 let ``session-event idempotency: SessionLocked delivered twice while already locked is a no-op`` () =
-    // Windows is known to double-fire SessionSwitch (rfc-core-brain.md, R1-36).
+    // Windows is known to double-fire SessionSwitch (0001-core-brain.md, R1-36).
     let state = Policy.start (MonotonicMs 0L, noStamps)
     let initResult = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.InitSucceeded)
     let firstLock = Policy.step (someConfig, initResult.State, MonotonicMs 1L, WallClockMs 0L, Event.SessionLocked)
@@ -606,7 +606,7 @@ let ``a cooldown-suppressed InitFailed wedge restart stays saturated and fires i
 
 [<Fact>]
 let ``a long run of handleInvalid:false InitFailed events never requests a restart, even once RecoveryFailureThreshold and RecoveryCooldownMs are both long since satisfied (unplugged/absent camera)`` () =
-    // Regression for the unplug/replug analysis (rfc-core-brain.md, "Notes: Camera unplug/
+    // Regression for the unplug/replug analysis (0001-core-brain.md, "Notes: Camera unplug/
     // replug, analyzed"): the pre-success streak gate requires handle-invalid failures, so a
     // camera that is simply absent (never handle-invalid) must retry forever without ever
     // requesting a process restart -- restarting cannot summon a camera that isn't there.
@@ -633,7 +633,7 @@ let ``CaptureFailed after InitSucceeded requests Action.Restart CameraWedged unc
 
 [<Fact>]
 let ``CaptureFailed while Paused still requests Action.Restart, and the restart preserves the pause`` () =
-    // Deliberate asymmetry (rfc-core-brain.md, R2-10): sample-driven decisions are pause-immune,
+    // Deliberate asymmetry (0001-core-brain.md, R2-10): sample-driven decisions are pause-immune,
     // failure-driven restarts are not -- the camera is kept alive while paused, so its death is
     // a real fact requiring recovery, and R1-30's persisted pause flag exists precisely so such
     // a restart preserves the pause.
@@ -657,7 +657,7 @@ let ``a cooldown-suppressed CaptureFailed returns Action.NoAction (the shell fal
 
 [<Fact>]
 let ``scenario: a cooldown-suppressed CaptureFailed recovers via the NoFrame-to-reevaluation backstop, with no new mechanism`` () =
-    // rfc-core-brain.md, "Notes: recovery boundary" -- the cooldown-suppressed CaptureFailed
+    // 0001-core-brain.md, "Notes: recovery boundary" -- the cooldown-suppressed CaptureFailed
     // backstop (R2-2): core-side, the suppressed path returns NoAction; the shell tears down the
     // dead capture but keeps the sample timer running, so SampleAsync with a null reader emits
     // Sample(NoFrame, ...) on every subsequent tick. This scenario reproduces exactly that using
@@ -690,7 +690,7 @@ let ``scenario: a cooldown-suppressed CaptureFailed recovers via the NoFrame-to-
 
 [<Fact>]
 let ``BetterCameraAvailable before any InitSucceeded is a no-op`` () =
-    // Pre-first-success (rfc-core-brain.md addendum): the acquisition retry loop already
+    // Pre-first-success (0001-core-brain.md addendum): the acquisition retry loop already
     // re-runs camera selection on every attempt, so a restart here would be pure waste.
     let state = Policy.start (MonotonicMs 0L, noStamps)
     let result = Policy.step (someConfig, state, MonotonicMs 0L, WallClockMs 0L, Event.BetterCameraAvailable)
@@ -767,7 +767,7 @@ module PropertyTests =
         let atExpiry = Policy.snapshot (config, state, MonotonicMs(startMs + config.GraceMs))
         justBeforeExpiry.InGrace && not atExpiry.InGrace
 
-    // --- Properties 1-3, 7 (rfc-core-brain.md, slice 3) ------------------------------------
+    // --- Properties 1-3, 7 (0001-core-brain.md, slice 3) ------------------------------------
     //
     // Restricted to the event subset slice 3 actually implements — `Sample`/`InitSucceeded` —
     // per "table tests restricted to what's expressible without SessionUnlocked/Resumed/
@@ -797,7 +797,7 @@ module PropertyTests =
 
     /// Per-tick result, paired with the two independent test-side models the properties check
     /// against — never against `Snapshot.Armed`/derived `State` fields, which would make the
-    /// implementation its own oracle (rfc-core-brain.md finding R2-28). Both models reflect
+    /// implementation its own oracle (0001-core-brain.md finding R2-28). Both models reflect
     /// only the baseline events slice 3 implements (`start`, `InitSucceeded`); slice 5 extends
     /// them with `SessionUnlocked` (unless paused)/`Resumed`.
     type private TickResult =
@@ -936,7 +936,7 @@ module PropertyTests =
                             neverLocked <- false
                 neverLocked)
 
-    // --- Properties 4, 6 (rfc-core-brain.md, slice 4) ---------------------------------------
+    // --- Properties 4, 6 (0001-core-brain.md, slice 4) ---------------------------------------
 
     let private badSignalObservationGen : Gen<Observation> =
         Gen.elements [ Observation.NoFrame; Observation.DarkFrame ]
@@ -1011,10 +1011,10 @@ module PropertyTests =
             |> List.pairwise
             |> List.forall (fun (a, b) -> b - a >= config.ReevaluateCooldownMs))
 
-    // --- Property 8 (rfc-core-brain.md, slice 5) --------------------------------------------
+    // --- Property 8 (0001-core-brain.md, slice 5) --------------------------------------------
 
     /// Independent test-side model of the two flags `Sample`'s no-op gate depends on, updated
-    /// by the same truth table `step` itself implements (rfc-core-brain.md, "Session/pause
+    /// by the same truth table `step` itself implements (0001-core-brain.md, "Session/pause
     /// precedence") — never read back from `Policy.status`/`Snapshot`, which would make the
     /// implementation its own oracle (same discipline as property 1's independent armed model,
     /// R2-28).
@@ -1056,7 +1056,7 @@ module PropertyTests =
                 List.fold folder (initialState, startMs, false, false, true) ticks
             ok)
 
-    // --- Properties 5, 9 (rfc-core-brain.md, slice 6) ---------------------------------------
+    // --- Properties 5, 9 (0001-core-brain.md, slice 6) ---------------------------------------
 
     [<Property>]
     let ``property 5: at most one Action.Restart CameraWedged per RecoveryCooldownMs window``
@@ -1119,7 +1119,7 @@ module PropertyTests =
             let _, _, ok = List.fold folder (initialState, startMs, true) ticks
             ok)
 
-    // --- Property 12 (rfc-core-brain.md addendum 2026-08-01, slice 10) ---------------------
+    // --- Property 12 (0001-core-brain.md addendum 2026-08-01, slice 10) ---------------------
 
     [<Property>]
     let ``property 12: at most one Action.Restart CameraUpgrade per UpgradeCooldownMs window``

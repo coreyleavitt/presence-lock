@@ -26,7 +26,7 @@ behavior, presence debouncing, and the camera-lifecycle rules — live in
 | `PresenceLock.Tests` | C# (xunit) | Shell-side tests for the pure helpers in `PolicyBridge.cs` |
 
 The design reference is [`ARCHITECTURE.md`](ARCHITECTURE.md); the original RFC and
-decision record are preserved in [`rfc-core-brain.md`](rfc-core-brain.md).
+decision record are preserved in [`0001-core-brain.md`](0001-core-brain.md).
 
 ## Build & test
 

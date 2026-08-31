@@ -16,7 +16,7 @@ let wallClockMsGen : Gen<WallClockMs> =
     Gen.choose (0, Int32.MaxValue) |> Gen.map (fun ms -> WallClockMs(int64 ms))
 
 /// A `PolicyConfig` drawn from the space the shell's load-time validation actually allows
-/// through to `step`/`snapshot` (rfc-core-brain.md, "Config: file schema, mapping,
+/// through to `step`/`snapshot` (0001-core-brain.md, "Config: file schema, mapping,
 /// validation"): every `*Ms` field positive, `RecoveryFailureThreshold >= 1`, and
 /// `ReevaluateAfterMs >= NoSignalReportAfterMs` so the no-signal status is always reachable
 /// before a re-evaluation restart. Out-of-range/invalid configs are a shell-side validation
@@ -68,7 +68,7 @@ let eventGen : Gen<Event> =
           Gen.constant Event.Resumed
           Gen.constant Event.BetterCameraAvailable ]
 
-/// A normalized face box within the unit frame (rfc-core-brain.handoff.md, "Burn-in incident
+/// A normalized face box within the unit frame (0001-core-brain.handoff.md, "Burn-in incident
 /// 2026-07-28"): width/height are strictly positive — a real detector never reports a
 /// zero-area box — and the box is fully contained in the unit square, matching how the shell
 /// normalizes a detection by the gray frame's `PixelWidth`/`PixelHeight` before calling
@@ -93,7 +93,7 @@ let private nullableWallClockGen : Gen<Nullable<int64>> =
 /// "no restart of this reason has ever happened," independently per field — the shape later
 /// cooldown properties (5 and 6, landing in slices 4 and 6) quantify over. Cross-restart
 /// cooldown continuity is the entire point of the wall-clock stamp design, so slice 2 seeds
-/// this generator even though nothing yet consumes it beyond pass-through (rfc-core-brain.md
+/// this generator even though nothing yet consumes it beyond pass-through (0001-core-brain.md
 /// finding R2-19).
 let restartStampsGen : Gen<RestartStamps> =
     gen {

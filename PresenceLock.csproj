@@ -33,7 +33,7 @@
 
   <!--
     Do not add an explicit FSharp.Core PackageReference here — it flows transitively from
-    this ProjectReference (rfc-core-brain.md, slice 1).
+    this ProjectReference (0001-core-brain.md, slice 1).
   -->
   <ItemGroup>
     <ProjectReference Include="PresenceLock.Core\PresenceLock.Core.fsproj" />

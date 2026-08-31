@@ -7,7 +7,7 @@ open FsCheck.Xunit
 open PresenceLock.Core
 open PresenceLock.Core.Tests.Generators
 
-/// rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28": IoU is the sole geometry
+/// 0001-core-brain.handoff.md, "Burn-in incident 2026-07-28": IoU is the sole geometry
 /// primitive `PresenceFilter.step`'s spatial-coherence gate is built on, so its own math is
 /// verified independently before any time-based stability behavior is tested against it.
 [<Fact>]
@@ -23,7 +23,7 @@ let ``disjoint boxes have IoU 0`` () =
 
 let private ms (n: int64) = MonotonicMs n
 
-/// rfc-core-brain.md bug-fix note (false-lock window): the pinned redesign — presence is
+/// 0001-core-brain.md bug-fix note (false-lock window): the pinned redesign — presence is
 /// stable once one unbroken coherent run has spanned `MinCoherentMs` of monotonic time,
 /// independent of how many samples arrived along the way.
 [<Fact>]
@@ -120,7 +120,7 @@ let ``a grey-band IoU never builds an unstable run toward stability`` () =
     Assert.False(r2.StablePresence)
     Assert.False(r3.StablePresence)
 
-/// rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28": the exact shape of the original
+/// 0001-core-brain.handoff.md, "Burn-in incident 2026-07-28": the exact shape of the original
 /// diagnosed failure -- FaceSeen/NoFace alternating every sample -- reproduced against the
 /// time-based filter across a realistic 500ms sampling cadence.
 [<Fact>]

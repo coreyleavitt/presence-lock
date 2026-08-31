@@ -2,7 +2,7 @@ namespace PresenceLock.Core
 
 /// The decision core: pure functions from `(PolicyConfig, State, time, Event)` to a new
 /// `State` plus a single `Action`. No clocks, no I/O — every `now`/`nowWall` is a caller-
-/// supplied parameter (rfc-core-brain.md, "Time semantics").
+/// supplied parameter (0001-core-brain.md, "Time semantics").
 module Policy =
 
     /// Called exactly once per process, in the shell's `WatcherContext` constructor, before
@@ -22,10 +22,10 @@ module Policy =
           BadSignalSince = None
           Stamps = stamps
           // Fresh state, pre-first-event: not paused, not locked, no failure yet, no success
-          // yet — priority row 4 (Status priority table, rfc-core-brain.md "Notes").
+          // yet — priority row 4 (Status priority table, 0001-core-brain.md "Notes").
           CachedStatus = Status.AcquiringCamera }
 
-    /// Total, priority-ordered `State -> Status` projection (rfc-core-brain.md, the Status
+    /// Total, priority-ordered `State -> Status` projection (0001-core-brain.md, the Status
     /// priority table in "Notes"). `PolicyConfig`/`now` are needed only for row 5 (`NoSignal`):
     /// whether the current continuous bad-signal run has crossed `NoSignalReportAfterMs` as of
     /// this step's `now`. Rows 1-4 are pure `State` predicates. Recomputed on every `step` and
@@ -64,7 +64,7 @@ module Policy =
         else
             true
 
-    /// Shared wedge-restart decision (rfc-core-brain.md slice-6 refactor note, R2-30): given
+    /// Shared wedge-restart decision (0001-core-brain.md slice-6 refactor note, R2-30): given
     /// whether the caller already wants to request a `CameraWedged` restart (`InitFailed` gates
     /// this on streak+classification before calling in; `CaptureFailed` always wants it once
     /// `HasSucceededOnce`), applies the `RecoveryCooldownMs` gate against `Stamps.WedgeAt` via
@@ -84,7 +84,7 @@ module Policy =
 
     /// A baseline-event reset shared by `InitSucceeded`, `SessionUnlocked` (unless paused), and
     /// `Resumed` (unless already resumed): disarm, re-baseline grace/away from `now`, and reset
-    /// the signal-health clock (rfc-core-brain.md, R2-20) — parity with `ResumeSampling()`'s
+    /// the signal-health clock (0001-core-brain.md, R2-20) — parity with `ResumeSampling()`'s
     /// `noSignalStreak = 0`. Deliberately leaves `IsPaused`/`IsSessionLocked` untouched; each
     /// caller sets exactly the flag(s) its own event owns.
     let private applyBaselineReset (now: MonotonicMs) (state: State) : State =
@@ -101,7 +101,7 @@ module Policy =
         (config: PolicyConfig, state: State, now: MonotonicMs, nowWall: WallClockMs, event: Event)
         : StepResult =
         match event with
-        // Defense in depth (rfc-core-brain.md, "Sample events outside the watching window"):
+        // Defense in depth (0001-core-brain.md, "Sample events outside the watching window"):
         // `Sample` is a complete no-op — unchanged `State`, no effects — whenever paused or
         // session-locked, regardless of observation kind. This must be checked ahead of the
         // per-observation arms below, not folded into each of them individually, since it
@@ -194,7 +194,7 @@ module Policy =
             { State = updated; Action = Action.NoAction }
         | Event.SessionUnlocked ->
             if state.IsPaused then
-                // Pause-precedence (rfc-core-brain.md truth table): a SessionUnlocked while
+                // Pause-precedence (0001-core-brain.md truth table): a SessionUnlocked while
                 // paused is a complete no-op, matching Program.cs's `if (paused) return;` guard
                 // in OnSessionSwitch -- it must not re-baseline, arm, or move Status away from
                 // Paused. Only an explicit Resumed clears the pause.
@@ -223,7 +223,7 @@ module Policy =
                 // clock on a stray duplicate SessionSwitch).
                 { State = state; Action = Action.NoAction }
         | Event.InitFailed handleInvalid ->
-            // Pre-success only in practice (rfc-core-brain.md, "Notes: recovery boundary").
+            // Pre-success only in practice (0001-core-brain.md, "Notes: recovery boundary").
             // InitFailStreak counts every consecutive pre-success InitFailed regardless of
             // classification -- the Status priority table's row 3 reads "no InitSucceeded yet;
             // >=1 InitFailed seen," not ">=1 handle-invalid InitFailed seen," so Status.Recovering
@@ -245,7 +245,7 @@ module Policy =
             let action = if restartDue then Action.Restart RestartReason.CameraWedged else Action.NoAction
             { State = updated; Action = action }
         | Event.CaptureFailed ->
-            // A previously-live capture just died (rfc-core-brain.md, "Notes: recovery
+            // A previously-live capture just died (0001-core-brain.md, "Notes: recovery
             // boundary"). Deliberately *not* gated by IsPaused/IsSessionLocked -- unlike Sample,
             // failure events are pause-immune by design (R2-10): the camera is kept alive while
             // paused, so its death is a real fact requiring recovery regardless, and this branch

@@ -2,7 +2,7 @@ namespace PresenceLock.Core
 
 open System
 
-/// The full public type surface of the Core decision boundary (rfc-core-brain.md, "Types").
+/// The full public type surface of the Core decision boundary (0001-core-brain.md, "Types").
 /// `PresenceLock.Core` is pure decision logic: no clocks, no I/O, no mutation visible to
 /// callers. Time is always a parameter — see the two clock-domain wrappers immediately below.
 
@@ -129,7 +129,7 @@ type RestartStamps =
 /// even though slice 2 exercises only the baseline subset (`HasSucceededOnce` = false,
 /// `InitFailStreak` = 0, `Armed` = false, baselines = `start`'s `now`, no bad signal, stamps
 /// carried through unchanged). Later slices fill in `step`'s logic against these fields, not
-/// shape churn (rfc-core-brain.md finding R2-33).
+/// shape churn (0001-core-brain.md finding R2-33).
 type State =
     internal
         { /// Whether `InitSucceeded` has ever fired this process — gates `Status.AcquiringCamera`

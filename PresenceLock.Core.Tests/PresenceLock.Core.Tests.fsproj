@@ -14,7 +14,7 @@
   </ItemGroup>
 
   <!--
-    Pinned per rfc-core-brain.md slice 1: xunit 2.9.x + FsCheck 2.16.x + FsCheck.Xunit,
+    Pinned per 0001-core-brain.md slice 1: xunit 2.9.x + FsCheck 2.16.x + FsCheck.Xunit,
     the proven pairing — not "latest of both majors together" (FsCheck 3.x changed
     Arbitrary registration and namespaces; xunit v3 is a different runner model).
   -->

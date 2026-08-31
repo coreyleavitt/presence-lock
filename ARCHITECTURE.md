@@ -3,7 +3,7 @@
 PresenceLock is a **functional core / imperative shell** design split across two
 languages. This document describes the current state of the design and the invariants
 that must hold; the original design process, including the full decision record, is
-preserved in [`rfc-core-brain.md`](rfc-core-brain.md).
+preserved in [`0001-core-brain.md`](0001-core-brain.md).
 
 ## The core/shell boundary
 

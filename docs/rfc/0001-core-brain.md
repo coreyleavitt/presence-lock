@@ -1,5 +1,8 @@
 # RFC: PresenceLock.Core — full-brain policy extraction to F#
 
+Status: Implemented (all code slices shipped through 1.0.8.4; stage-4 code review pending, to run
+over this scope together with 0002-environment-levels.md once that RFC's slices land)
+
 ## Motivation
 
 Every shipped defect in PresenceLock's first day except the FrameServer wedge itself was a

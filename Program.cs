@@ -44,7 +44,7 @@ sealed class Config
     // Mean 8-bit luminance below this is a blocked/dark camera, not an empty room.
     public double DarkFrameMeanThreshold { get; init; } = 6.0;
 
-    // Six PolicyConfig-mapped fields (rfc-core-brain.md, "Config" mapping table, extended by
+    // Six PolicyConfig-mapped fields (0001-core-brain.md, "Config" mapping table, extended by
     // the 2026-08-01 addendum's UpgradeCooldownMs). Existing on-disk files simply lack these
     // keys and get these defaults, exactly like every other absent field today — the schema
     // stays backward-compatible. Consumed only by PolicyBridge.BuildPolicyConfig; no shell
@@ -116,12 +116,12 @@ static class Log
 sealed class WatcherContext : ApplicationContext
 {
     Config cfg;
-    // The real decision core (rfc-core-brain.md, slice 8b cutover): the sole decision-maker.
+    // The real decision core (0001-core-brain.md, slice 8b cutover): the sole decision-maker.
     // `Advance` is the only place `state` is reassigned. `policyConfig` is rebuilt whenever
     // `cfg` changes (Settings commit) so `step` always reads live config.
     Core.PolicyConfig policyConfig;
     Core.State state;
-    // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
+    // Presence-stabilization filter (0001-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
     // raw per-frame FaceDetector output flickers false-positive on an empty scene under a
     // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/Advance, so every
     // downstream consumer sees the identical stabilized presence signal. Reset to
@@ -131,7 +131,7 @@ sealed class WatcherContext : ApplicationContext
     // paused), and TogglePause's resume branch — since spatial coherence measured against a
     // previous acquisition's or watching episode's frames must never carry into a new one.
     Core.FilterState presenceFilterState;
-    // Frozen-frame staleness (rfc-core-brain.md bug-fix note): tracks whether the frame
+    // Frozen-frame staleness (0001-core-brain.md bug-fix note): tracks whether the frame
     // reader's SystemRelativeTime is still advancing. Stepped in SampleAsync alongside
     // presenceFilterState, and reset at exactly the same points — a fresh acquisition's or
     // watching episode's first frame must not be judged stale against a previous acquisition's
@@ -149,7 +149,7 @@ sealed class WatcherContext : ApplicationContext
     // makes those states a no-op inside the pure step), stopped only at process exit alongside
     // sampleTimer. See lastSamplePassAt/watchdogStrikes below and PolicyBridge.SamplingWatchdogStep.
     readonly WinFormsTimer watchdogTimer;
-    // Camera-arrival upgrade (rfc-core-brain.md addendum 2026-08-01, slice 10): debounces a
+    // Camera-arrival upgrade (0001-core-brain.md addendum 2026-08-01, slice 10): debounces a
     // burst of DeviceWatcher.Added events (a dock enumerates several devices over seconds)
     // into a single would-pick-now check, restarted on every Added event seen after
     // EnumerationCompleted.
@@ -161,7 +161,7 @@ sealed class WatcherContext : ApplicationContext
     FaceDetector? detector;
     MediaCapture? capture;
     MediaFrameReader? reader;
-    // The in-use camera's MediaFrameSourceInfo.Id (rfc-core-brain.md addendum 2026-08-01):
+    // The in-use camera's MediaFrameSourceInfo.Id (0001-core-brain.md addendum 2026-08-01):
     // set on every successful InitCameraAsync, cleared on teardown. CheckForBetterCamera
     // compares this against SelectPreferredCamera's would-pick-now result.
     string? activeCameraId;
@@ -179,13 +179,13 @@ sealed class WatcherContext : ApplicationContext
     int watchdogStrikes;
     bool starting;
     bool settingsOpen;
-    // The shell's own current-sample dark-vs-no-frame knowledge (rfc-core-brain.md:
+    // The shell's own current-sample dark-vs-no-frame knowledge (0001-core-brain.md:
     // "Status.NoSignal does not distinguish dark vs. no-frame ... the shell already computed
     // that distinction itself one line before constructing the Observation"). Set every sample
     // in SampleAsync, read only for rendering/logging the finer-grained NoSignal text — never
     // fed back into Core, never a decision input.
     bool lastObservationDark;
-    // Dedup for the tray/status render (rfc-core-brain.md: "the shell ... re-renders only when
+    // Dedup for the tray/status render (0001-core-brain.md: "the shell ... re-renders only when
     // the rendered string differs").
     string? lastRenderedStatusText;
 
@@ -251,7 +251,7 @@ sealed class WatcherContext : ApplicationContext
         retryTimer.Tick += async (_, _) =>
         {
             retryTimer.Stop();
-            // Retry-timer gate (rfc-core-brain.md R2-15): the complete, core-owned test —
+            // Retry-timer gate (0001-core-brain.md R2-15): the complete, core-owned test —
             // replaces the legacy `!paused && !sessionLocked` shell-local booleans. This is one
             // of the three call sites sharing the identical status gate (R2-4); the other two
             // are the direct KickAcquisitionIfNeeded() calls below.
@@ -294,7 +294,7 @@ sealed class WatcherContext : ApplicationContext
 
         SystemEvents.SessionSwitch += OnSessionSwitch;
 
-        // Camera-arrival upgrade (rfc-core-brain.md addendum 2026-08-01, slice 10): events
+        // Camera-arrival upgrade (0001-core-brain.md addendum 2026-08-01, slice 10): events
         // marshaled to the UI thread — same precedent as OnSessionSwitch — since DeviceWatcher
         // raises them from its own background thread. Ignore the initial-enumeration Added
         // backfill (guarded by deviceEnumerationCompleted below); react only to a genuine
@@ -319,14 +319,14 @@ sealed class WatcherContext : ApplicationContext
         Log.Write($"started (threshold {cfg.AwayThresholdSeconds}s, sample {cfg.SampleIntervalMs}ms)");
 
         // Policy.start is called exactly once per process, before the first camera-acquisition
-        // attempt (rfc-core-brain.md, Policy.start doc comment).
+        // attempt (0001-core-brain.md, Policy.start doc comment).
         state = Core.Policy.start(
             Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
             PolicyBridge.LoadRestartStamps());
         presenceFilterState = Core.PresenceFilter.initial;
         frameFreshnessState = Core.FrameFreshness.initial;
 
-        // Paused-flag consume-and-clear (rfc-core-brain.md R2-11, pinned lifecycle): read →
+        // Paused-flag consume-and-clear (0001-core-brain.md R2-11, pinned lifecycle): read →
         // feed Event.Paused through Advance immediately after Policy.start → rewrite cleared.
         // Written only by RestartProcess, immediately before spawn — so pause survives every
         // self-restart, but a tray Exit or a normal launch never inherits a stale pause.
@@ -370,7 +370,7 @@ sealed class WatcherContext : ApplicationContext
             // process recovers. Match on message too: the WinRT projection wraps the error and
             // does not always preserve the E_HANDLE HResult. Advance(InitFailed) is the core's
             // only gate on that decision now — streak + handle-invalid classification +
-            // wall-clock cooldown persisted across restarts (rfc-core-brain.md, "Notes:
+            // wall-clock cooldown persisted across restarts (0001-core-brain.md, "Notes:
             // recovery boundary").
             bool handleInvalid = PolicyBridge.IsHandleInvalid(ex);
             if (Advance(Core.Event.NewInitFailed(handleInvalid))) return; // Action.Restart executed — process exiting
@@ -389,7 +389,7 @@ sealed class WatcherContext : ApplicationContext
 
     // Color-camera candidates as (Group, Info) pairs — the live WinRT handles selection needs
     // to actually open a camera. Shared by InitCameraAsync's startup selection and the device-
-    // watcher's arrival-triggered settle check (rfc-core-brain.md addendum 2026-08-01, slice
+    // watcher's arrival-triggered settle check (0001-core-brain.md addendum 2026-08-01, slice
     // 10) so both enumerate identically; only the DTO projection below is what the pure
     // ranking function sees.
     static async Task<List<(MediaFrameSourceGroup Group, MediaFrameSourceInfo Info)>> ColorCameraCandidatesAsync()
@@ -413,9 +413,9 @@ sealed class WatcherContext : ApplicationContext
         if (candidates.Count == 0)
             throw new InvalidOperationException("no color camera found");
 
-        // Camera *selection* stays shell-side sensing (rfc-core-brain.md, "Notes"), but the
+        // Camera *selection* stays shell-side sensing (0001-core-brain.md, "Notes"), but the
         // ranking itself is the one pure, unit-tested function shared with the device-watcher
-        // settle check (rfc-core-brain.md addendum 2026-08-01, slice 10) — behavior-preserving
+        // settle check (0001-core-brain.md addendum 2026-08-01, slice 10) — behavior-preserving
         // refactor of what this method computed inline before this slice.
         var chosenId = PolicyBridge.SelectPreferredCamera(ToCandidateDtos(candidates), cfg.CameraNameContains);
         var chosen = candidates.First(t => t.Info.Id == chosenId);
@@ -465,7 +465,7 @@ sealed class WatcherContext : ApplicationContext
     // `present` here is the stabilized PresenceFilter output (SampleAsync sets it before this
     // call), so `obs`/`diagLastObs` transitions now reflect stabilized observations; `rawFaceCount`
     // is appended so the raw FaceDetector signal a stabilized FaceSeen/NoFace transition summarizes
-    // is still visible in the log (rfc-core-brain.handoff.md, "Burn-in incident 2026-07-28").
+    // is still visible in the log (0001-core-brain.handoff.md, "Burn-in incident 2026-07-28").
     // `frameIsFresh` is the authoritative Core.FrameFreshness verdict SampleAsync already
     // computed for this sample — `null` when freshness couldn't be assessed (no frame acquired,
     // or SystemRelativeTime unavailable) — this method only logs its fresh<->stale transition,
@@ -492,7 +492,7 @@ sealed class WatcherContext : ApplicationContext
     async Task SampleAsync()
     {
         if (sampling || detector is null) return;
-        // Defense in depth (rfc-core-brain.md, "Sample events outside the watching window"):
+        // Defense in depth (0001-core-brain.md, "Sample events outside the watching window"):
         // Core already no-ops a Sample while Paused/SessionLocked, but discard here too rather
         // than pay for a frame acquisition and face-detection pass that can't matter — the
         // sampleTimer is stopped in both states anyway, so this only guards a narrow race.
@@ -535,7 +535,7 @@ sealed class WatcherContext : ApplicationContext
                         {
                             var faces = await detector.DetectFacesAsync(gray);
                             rawFaceCount = faces.Count;
-                            // Presence-stabilization filter (rfc-core-brain.handoff.md, "Burn-in
+                            // Presence-stabilization filter (0001-core-brain.handoff.md, "Burn-in
                             // incident 2026-07-28"): stepped here, upstream of ClassifySample and
                             // Advance, so `present` is the identical stabilized signal every
                             // downstream consumer observes.
@@ -553,7 +553,7 @@ sealed class WatcherContext : ApplicationContext
                 }
             }
             // `reader is null` here (a cooldown-suppressed CaptureFailed backstop —
-            // rfc-core-brain.md, "Notes: recovery boundary") falls straight through as
+            // 0001-core-brain.md, "Notes: recovery boundary") falls straight through as
             // haveFrame=false, i.e. Observation.NoFrame — the shell keeps sampleTimer running
             // so the NoFrame → re-evaluation backstop engages on the ordinary signal-health path,
             // with no separate mechanism. Every resume path now guarantees sampleTimer is running
@@ -597,7 +597,7 @@ sealed class WatcherContext : ApplicationContext
             {
                 // Fed to Core unconditionally, even while paused: the pause-precedence rule
                 // (SessionUnlocked while paused is a no-op) is core-owned, not shell-owned —
-                // see rfc-core-brain.md's pause/unlock truth table.
+                // see 0001-core-brain.md's pause/unlock truth table.
                 Advance(Core.Event.SessionUnlocked);
                 if (Core.Policy.status(state).Tag == Core.Status.Tags.Paused) return;
 
@@ -628,7 +628,7 @@ sealed class WatcherContext : ApplicationContext
                     Log.Write("resumed after unlock (no camera — sampling resumes for signal-driven recovery)");
                 }
                 sampleTimer.Start();
-                // KickAcquisitionIfNeeded (rfc-core-brain.md R2-4) — one of the three call
+                // KickAcquisitionIfNeeded (0001-core-brain.md R2-4) — one of the three call
                 // sites sharing the core-owned status gate: names the mechanism today's code
                 // implements as a direct StartWatchingAsync() call, so the self-stopping retry
                 // timer isn't the only thing that can reacquire after a lock/pause.
@@ -639,7 +639,7 @@ sealed class WatcherContext : ApplicationContext
     void OnCaptureFailed(MediaCapture sender, MediaCaptureFailedEventArgs args) =>
         ui.Post(_ =>
         {
-            // IsHandleInvalid still classifies here for this log line only (rfc-core-brain.md,
+            // IsHandleInvalid still classifies here for this log line only (0001-core-brain.md,
             // "Notes: recovery boundary" / R2-7's args-form requirement) — the restart decision
             // itself no longer depends on the classification once InitSucceeded has occurred.
             bool handleInvalid = PolicyBridge.IsHandleInvalid(unchecked((int)args.Code), args.Message);
@@ -689,7 +689,7 @@ sealed class WatcherContext : ApplicationContext
         }
     }
 
-    // KickAcquisitionIfNeeded (rfc-core-brain.md R2-4): the complete, core-owned gate for
+    // KickAcquisitionIfNeeded (0001-core-brain.md R2-4): the complete, core-owned gate for
     // "should we attempt (re)acquisition" — replaces the legacy shell-local
     // `!paused && !sessionLocked` booleans with the single status test shared by the retry
     // timer's Tick guard and both direct call sites below.
@@ -699,7 +699,7 @@ sealed class WatcherContext : ApplicationContext
             _ = StartWatchingAsync();
     }
 
-    // The single Advance(Event) chokepoint (rfc-core-brain.md, slice 8b cutover): the only
+    // The single Advance(Event) chokepoint (0001-core-brain.md, slice 8b cutover): the only
     // place `state` is reassigned. Computes now/nowWall back to back, calls Policy.step,
     // executes the returned Action, logs Policy.snapshot alongside Lock/Restart (R1-34), logs
     // the once-per-episode dark-vs-no-frame transition into Status.NoSignal (R2-29), and
@@ -748,7 +748,7 @@ sealed class WatcherContext : ApplicationContext
         return false;
     }
 
-    // Action.Lock execution discipline (rfc-core-brain.md R2-18): stop sampleTimer
+    // Action.Lock execution discipline (0001-core-brain.md R2-18): stop sampleTimer
     // synchronously BEFORE calling LockWorkStation(), restarting it only if the Win32 call
     // fails — preserving the guard against a second timer tick re-deriving Lock in the window
     // before the real OS SessionLock notification arrives. Core takes no side-channel action on
@@ -770,7 +770,7 @@ sealed class WatcherContext : ApplicationContext
 
     // Logs Policy.snapshot alongside the restart reason (R1-34), then hands off to the
     // mechanical RestartProcess() — RestartReason changes only the log line, never the restart
-    // mechanism (rfc-core-brain.md, "Shell changes").
+    // mechanism (0001-core-brain.md, "Shell changes").
     void ExecuteRestart(Core.RestartReason reason, Core.MonotonicMs monotonic)
     {
         var snap = Core.Policy.snapshot(policyConfig, state, monotonic);
@@ -828,7 +828,7 @@ sealed class WatcherContext : ApplicationContext
         activeCameraId = null;
     }
 
-    // Camera-arrival upgrade settle check (rfc-core-brain.md addendum 2026-08-01, slice 10):
+    // Camera-arrival upgrade settle check (0001-core-brain.md addendum 2026-08-01, slice 10):
     // fires ~5s after the last DeviceWatcher.Added event in a burst. Compares the in-use
     // camera against SelectPreferredCamera's would-pick-now result over a fresh enumeration —
     // the identical ranking InitCameraAsync uses — and, on a mismatch, lets the core decide
@@ -882,7 +882,7 @@ sealed class WatcherContext : ApplicationContext
             var oldFilter = cfg.CameraNameContains;
             cfg = form.Result;
             SaveConfig(cfg);
-            // Live config (rfc-core-brain.md, "Notes"): PolicyConfig is read live on every
+            // Live config (0001-core-brain.md, "Notes"): PolicyConfig is read live on every
             // step, so a committed Settings change must be visible on the very next sample too,
             // via the same shared mapping function file-load uses (BuildPolicyConfig) — the
             // Settings commit path routes through it already; nothing else to wire here.
@@ -897,7 +897,7 @@ sealed class WatcherContext : ApplicationContext
                 // FrameServer on this machine — restart the whole process instead; a fresh
                 // process's first init is reliable. Shell-only mechanical decision (trivial
                 // string comparison, not policy) — not routed through Policy, and
-                // RestartReason is not extended for it (rfc-core-brain.md, "Shell changes").
+                // RestartReason is not extended for it (0001-core-brain.md, "Shell changes").
                 Log.Write("camera filter changed — restarting process to switch cameras");
                 RestartProcess();
             }
@@ -924,7 +924,7 @@ sealed class WatcherContext : ApplicationContext
 
     // Mechanical restart, shared by every restart trigger — core-driven (via ExecuteRestart)
     // and shell-driven (the Settings camera-filter-change path) alike: RestartReason changes
-    // only the log line, never this mechanism. Ordering audited per rfc-core-brain.md
+    // only the log line, never this mechanism. Ordering audited per 0001-core-brain.md
     // R1-23/R2-25: stop timers → write stamps/paused flag → release mutex → spawn →
     // ExitThread() — timers stop before the mutex is released and the new process is spawned
     // (closing the handoff window where both processes could theoretically be live

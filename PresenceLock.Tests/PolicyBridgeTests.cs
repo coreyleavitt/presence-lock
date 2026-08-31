@@ -5,7 +5,7 @@ using Xunit;
 
 namespace PresenceLock.Tests;
 
-/// Dedicated shell-side xunit tests for PolicyBridge (rfc-core-brain.md, slice 8a /
+/// Dedicated shell-side xunit tests for PolicyBridge (0001-core-brain.md, slice 8a /
 /// "Config: file schema, mapping, validation" / R2-7). These are pure functions extracted
 /// from Program.cs specifically so they stop being "expected behavior existed only as code"
 /// (the RFC's Motivation) — each gets independent coverage here rather than only exercised
@@ -203,7 +203,7 @@ public class BuildPolicyConfigTests
     public void Sensing_only_fields_are_not_part_of_PolicyConfig_and_do_not_affect_the_fallback()
     {
         // CameraNameContains / DarkFrameMeanThreshold / SampleIntervalMs stay shell-only
-        // (rfc-core-brain.md) — a fat-fingered policy field must not touch them, and this
+        // (0001-core-brain.md) — a fat-fingered policy field must not touch them, and this
         // mapping function must never read them.
         var cfg = new Config { CameraNameContains = "Logitech", DarkFrameMeanThreshold = 42.0, SampleIntervalMs = 250 };
         var policy = PolicyBridge.BuildPolicyConfig(cfg);
@@ -329,7 +329,7 @@ public class ClassifySampleTests
     }
 }
 
-/// Shell-side helper feeding PresenceLock.Core's PresenceFilter (rfc-core-brain.handoff.md,
+/// Shell-side helper feeding PresenceLock.Core's PresenceFilter (0001-core-brain.handoff.md,
 /// "Burn-in incident 2026-07-28"). Takes plain `BitmapBounds` rather than `DetectedFace` itself
 /// so it stays unit-testable: `DetectedFace` has no public constructor and can only be produced
 /// by a real `FaceDetector` result.
@@ -381,7 +381,7 @@ public class LargestFaceBoxNormalizedTests
     }
 }
 
-/// Shell-side status→text mapping (rfc-core-brain.md, slice 8b deliverable). Pure and tested
+/// Shell-side status→text mapping (0001-core-brain.md, slice 8b deliverable). Pure and tested
 /// independently of WatcherContext per every Status case.
 public class StatusTextTests
 {
@@ -428,7 +428,7 @@ public class StatusTextTests
     }
 }
 
-/// The complete, core-owned retry/kick gate (rfc-core-brain.md R2-4/R2-15): true exactly for
+/// The complete, core-owned retry/kick gate (0001-core-brain.md R2-4/R2-15): true exactly for
 /// AcquiringCamera/Recovering, the pre-first-success-only statuses.
 public class IsAcquiringOrRecoveringTests
 {
@@ -566,7 +566,7 @@ public class SamplingWatchdogStepTests
     }
 }
 
-/// The camera preference ranking (rfc-core-brain.md addendum 2026-08-01, slice 10:
+/// The camera preference ranking (0001-core-brain.md addendum 2026-08-01, slice 10:
 /// camera-arrival upgrade), factored out of InitCameraAsync's original inline selection so
 /// startup selection and the arrival-triggered device watcher share one implementation. These
 /// tests are the proof that the extraction is behavior-preserving: every case here is exactly
@@ -645,7 +645,7 @@ public class SelectPreferredCameraTests
     [Fact]
     public void No_enclosure_location_external_over_built_in_front()
     {
-        // The exact ordering rfc-core-brain.md's original SelectionRank implemented: no
+        // The exact ordering 0001-core-brain.md's original SelectionRank implemented: no
         // enclosure location at all (external USB webcams) ranks above Front.
         var candidates = new[]
         {
@@ -694,7 +694,7 @@ public class LoadRestartStampsTests
     }
 }
 
-/// Stamps-file writer round-trip (rfc-core-brain.md, "Restart stamps" / R1-29) and the
+/// Stamps-file writer round-trip (0001-core-brain.md, "Restart stamps" / R1-29) and the
 /// paused-flag consume-and-clear file semantics (R2-11's pinned lifecycle). These tests read
 /// and write the real per-user stamps file (there is no seam to inject a path), matching
 /// LoadRestartStampsTests' existing precedent — each test restores the file to "absent" in a
@@ -748,7 +748,7 @@ public class RestartStampsPersistenceTests
         }
     }
 
-    /// Back-compat (rfc-core-brain.md addendum 2026-08-01, slice 10): a stamps file written by
+    /// Back-compat (0001-core-brain.md addendum 2026-08-01, slice 10): a stamps file written by
     /// a pre-slice-10 build has only WedgeAt/ReevalAt/Paused keys. The third field must load as
     /// null rather than fail, exactly like WedgeAt/ReevalAt themselves behaved before either had
     /// ever fired (R2-40's "confirming named Nullable fields remain the right shape at three").
@@ -822,7 +822,7 @@ public class RestartStampsPersistenceTests
     }
 }
 
-/// Migration cleanup (rfc-core-brain.md, "Restart stamps" / R2-34): the superseded
+/// Migration cleanup (0001-core-brain.md, "Restart stamps" / R2-34): the superseded
 /// last-restart.txt is deleted the first time SaveRestartStamps runs on an upgraded build.
 /// Same real-filesystem precedent as RestartStampsPersistenceTests — no seam to inject a path.
 public class LegacyRestartStampCleanupTests

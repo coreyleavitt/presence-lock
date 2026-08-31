@@ -7,7 +7,7 @@ using Core = PresenceLock.Core;
 namespace PresenceLock;
 
 /// Pure, shell-side helpers that bridge legacy sensing data to the `PresenceLock.Core` API
-/// (rfc-core-brain.md, slice 8a). Everything here is sensing/mapping, not policy — it stays
+/// (0001-core-brain.md, slice 8a). Everything here is sensing/mapping, not policy — it stays
 /// on the C# side of the boundary by design (RFC "Notes: recovery boundary" /
 /// "Config: file schema, mapping, validation") — but each function is exactly the class of
 /// "expected behavior existed only as code" defect the RFC's Motivation cites, so each is
@@ -16,7 +16,7 @@ static class PolicyBridge
 {
     /// Built-in defaults for all nine `PolicyConfig` fields (the ninth, `UpgradeCooldownMs`,
     /// added by the 2026-08-01 addendum), applied as a unit (never a partial mix —
-    /// rfc-core-brain.md, "Config" validation rules) whenever the persisted values fail
+    /// 0001-core-brain.md, "Config" validation rules) whenever the persisted values fail
     /// validation. Matches the pinned mapping table exactly.
     static readonly Core.PolicyConfig DefaultPolicyConfig = new(
         awayThresholdMs: 5000,
@@ -32,7 +32,7 @@ static class PolicyBridge
     /// Maps the flat, on-disk `Config` (unchanged schema) to `PolicyConfig`, per the pinned
     /// mapping table. Validates the nine policy fields as a single unit — any one out of
     /// range falls the whole set back to `DefaultPolicyConfig`, never a partially-defaulted
-    /// mix (rfc-core-brain.md: "a zero-filled cooldown would make the next camera hiccup an
+    /// mix (0001-core-brain.md: "a zero-filled cooldown would make the next camera hiccup an
     /// instant restart loop"). Sensing fields (`CameraNameContains`, `DarkFrameMeanThreshold`,
     /// `SampleIntervalMs`) are untouched by this function and never affected by a policy-field
     /// failure — except that `SampleIntervalMs` is read (not written) as one input to the
@@ -93,7 +93,7 @@ static class PolicyBridge
     /// `ArgumentOutOfRangeException` for a `SampleIntervalMs` &lt; 1 — a bad on-disk value could
     /// kill the app before the tray icon even existed. Each sensing field is validated and
     /// defaulted independently — deliberately not an all-or-nothing unit like
-    /// `BuildPolicyConfig`'s nine policy fields (rfc-core-brain.md: that unit exists because a
+    /// `BuildPolicyConfig`'s nine policy fields (0001-core-brain.md: that unit exists because a
     /// zero-filled cooldown makes the next camera hiccup an instant restart loop; no such
     /// cross-field coupling exists between `SampleIntervalMs` and `DarkFrameMeanThreshold`).
     /// `CameraNameContains` and every policy field pass through untouched — this function is
@@ -134,7 +134,7 @@ static class PolicyBridge
         };
     }
 
-    /// The real handle-invalid classifier (rfc-core-brain.md, "Notes: recovery boundary" /
+    /// The real handle-invalid classifier (0001-core-brain.md, "Notes: recovery boundary" /
     /// R2-7): HResult `0x80070006` OR a message-substring match, because the WinRT projection
     /// does not reliably preserve the HResult. Two-parameter form so `OnCaptureFailed` (which
     /// receives `MediaCaptureFailedEventArgs` — only `Code` + `Message`, no `Exception`) can
@@ -146,7 +146,7 @@ static class PolicyBridge
 
     internal static bool IsHandleInvalid(Exception ex) => IsHandleInvalid(ex.HResult, ex.Message);
 
-    /// The complete, core-owned gate for "should we attempt (re)acquisition" (rfc-core-brain.md
+    /// The complete, core-owned gate for "should we attempt (re)acquisition" (0001-core-brain.md
     /// R2-4/R2-15): true exactly while `Policy.status` is `AcquiringCamera` or `Recovering` —
     /// first-init retries only, per the Status priority table, which makes this test
     /// structurally incapable of gating a post-success in-process re-init. Shared by the retry
@@ -221,7 +221,7 @@ static class PolicyBridge
         return new WatchdogVerdict(Strikes: 0, StampMs: nowMs, StartSampleTimer: false, TreatAsCaptureFailed: true);
     }
 
-    /// Status → tray/status-text mapping (rfc-core-brain.md, slice 8b deliverable: "Status →
+    /// Status → tray/status-text mapping (0001-core-brain.md, slice 8b deliverable: "Status →
     /// tray/log mapping table implemented as a single function"). `lastObservationDark` is the
     /// shell's own current-sample dark-vs-no-frame knowledge (Core's `Status.NoSignal` does not
     /// distinguish the two — see "Notes" — the shell already computed the distinction one line
@@ -239,7 +239,7 @@ static class PolicyBridge
         _ => throw new UnreachableException(),
     };
 
-    /// Shared event-construction function (rfc-core-brain.md slice 8a: "Factor each call
+    /// Shared event-construction function (0001-core-brain.md slice 8a: "Factor each call
     /// site's event construction into a small named function... reused unchanged by 8a's
     /// `ShadowAdvance` and 8b's `Advance`"). The shell already computes `haveFrame`/`dark`/
     /// `present` one line before constructing the `Observation` today — this only names the
@@ -267,7 +267,7 @@ static class PolicyBridge
 
     /// Picks the largest detected face (by pixel area) and normalizes its bounding box to
     /// [0,1] by the frame's pixel dimensions, for `PresenceLock.Core`'s `PresenceFilter`
-    /// (spatially-coherent presence stabilization — rfc-core-brain.handoff.md, "Burn-in
+    /// (spatially-coherent presence stabilization — 0001-core-brain.handoff.md, "Burn-in
     /// incident 2026-07-28"). Takes `BitmapBounds` (a plain WinRT struct, not `DetectedFace`
     /// itself — `DetectedFace` has no public constructor and cannot be instantiated outside a
     /// real `FaceDetector` result, so this signature is the boundary that keeps the selection
@@ -300,7 +300,7 @@ static class PolicyBridge
     }
 
     /// Plain (id, display name, enclosure panel) projection of a candidate color camera
-    /// (rfc-core-brain.md addendum 2026-08-01, slice 10: camera-arrival upgrade) — the shape
+    /// (0001-core-brain.md addendum 2026-08-01, slice 10: camera-arrival upgrade) — the shape
     /// `SelectPreferredCamera` ranks over, kept independent of any live WinRT device handle so
     /// the ranking itself is unit-testable. `Id` is the candidate's `MediaFrameSourceInfo.Id`
     /// (unique per color source, and the same key `InitCameraAsync` already used to look up
@@ -309,7 +309,7 @@ static class PolicyBridge
     /// `InitCameraAsync`'s original inline `SelectionRank` treated a null `EnclosureLocation`.
     internal readonly record struct CameraCandidate(string Id, string DisplayName, EnclosurePanel Panel);
 
-    /// The camera preference ranking (rfc-core-brain.md addendum 2026-08-01, slice 10): the
+    /// The camera preference ranking (0001-core-brain.md addendum 2026-08-01, slice 10): the
     /// exact ordering `InitCameraAsync` computed inline before this slice — a non-blank user
     /// filter wins outright (first candidate whose display name contains it, case-insensitive,
     /// preserving input order), else external-over-built-in-front (no enclosure location /
@@ -343,14 +343,14 @@ static class PolicyBridge
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "PresenceLock", "restart-stamps.json");
 
-    /// The file this JSON stamps file supersedes (rfc-core-brain.md, "Restart stamps" / R2-34):
+    /// The file this JSON stamps file supersedes (0001-core-brain.md, "Restart stamps" / R2-34):
     /// a plain-text single wall-clock timestamp, replaced by `StampsPath`'s per-`RestartReason`
     /// JSON. Deleted the first time `SaveRestartStamps` runs on an upgraded build — see there.
     static readonly string LegacyRestartStampPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "PresenceLock", "last-restart.txt");
 
-    /// Reads the wall-clock stamps file (rfc-core-brain.md, "Restart stamps") if present, else
+    /// Reads the wall-clock stamps file (0001-core-brain.md, "Restart stamps") if present, else
     /// returns empty stamps — any read/parse error also yields empty, since a parse failure
     /// must never block recovery. Feeds `Policy.start` at every startup; the counterpart writer
     /// is `SaveRestartStamps`, called only from `RestartProcess()` immediately before spawn.
@@ -372,7 +372,7 @@ static class PolicyBridge
         return EmptyRestartStamps;
     }
 
-    /// Writer counterpart to `LoadRestartStamps` (rfc-core-brain.md, "Restart stamps" /
+    /// Writer counterpart to `LoadRestartStamps` (0001-core-brain.md, "Restart stamps" /
     /// R1-29): persists both stamp fields verbatim (Policy.step itself only ever bumps the one
     /// matching the reason it fired, so a plain round-trip here can't poison the other reason's
     /// cooldown) plus the paused flag, in one JSON write. Called only from `RestartProcess()`,
@@ -398,7 +398,7 @@ static class PolicyBridge
             Log.Write($"restart stamps save failed: {ex.Message}");
         }
 
-        // Migration cleanup (rfc-core-brain.md, "Restart stamps" / R2-34): last-restart.txt is
+        // Migration cleanup (0001-core-brain.md, "Restart stamps" / R2-34): last-restart.txt is
         // superseded by the stamps file above; delete it here, the first time this method runs
         // on an upgraded build. File.Delete is already a silent no-op when the path is absent
         // (true for every call after the first), so no separate "have we done this yet" state
@@ -414,7 +414,7 @@ static class PolicyBridge
         }
     }
 
-    /// Paused-flag consume-and-clear (rfc-core-brain.md R2-11, pinned lifecycle): reads the
+    /// Paused-flag consume-and-clear (0001-core-brain.md R2-11, pinned lifecycle): reads the
     /// persisted flag; if set, immediately rewrites the file with it cleared (stamps untouched)
     /// and returns true so the caller feeds `Event.Paused` through `Advance` right after
     /// `Policy.start`. Returns false — and touches nothing on disk — when absent/false/unparseable,
