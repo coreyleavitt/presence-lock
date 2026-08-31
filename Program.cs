@@ -7,6 +7,7 @@ using Microsoft.Win32;
 using Windows.Graphics.Imaging;
 using Windows.Media.Capture;
 using Windows.Media.Capture.Frames;
+using Windows.Media.Control;
 using Windows.Media.FaceAnalysis;
 using WinFormsTimer = System.Windows.Forms.Timer;
 using EnclosurePanel = Windows.Devices.Enumeration.Panel;
@@ -60,6 +61,14 @@ sealed class Config
     // RFC addendum 2026-08-01, slice 10 (camera-arrival upgrade): minimum gap between
     // CameraUpgrade restarts. No Settings UI control, same as the other five.
     public long UpgradeCooldownMs { get; init; } = 600000;
+
+    // RFC 0002-environment-levels, "Media provider (first inhibitor)": file-only kill switch,
+    // no Settings UI, same no-Settings-UI precedent as the seven fields above -- this feature
+    // deliberately weakens the lock (media playing vetoes an otherwise-earned Lock), so it gets
+    // an off switch. Structural-absence choice (see WatcherContext's constructor): disabling
+    // this means the media provider is never constructed and never registered with the
+    // inhibitor registry, rather than registered-but-permanently-queried-and-ignored.
+    public bool MediaInhibitorEnabled { get; init; } = true;
 
     public static Config Load()
     {
@@ -139,6 +148,66 @@ static class Log
     }
 }
 
+// Media provider (RFC 0002-environment-levels, "Media provider (first inhibitor)"): the first
+// registered LockInhibitor. GlobalSystemMediaTransportControlsSessionManager is acquired ONCE,
+// asynchronously, off the tick path -- InitializeAsync is fired exactly once, from
+// WatcherContext's constructor, never from the watchdog tick; IsActive (the Func<bool> query fed
+// into `new LockInhibitor("media-playing", ...)`) performs only synchronous property reads over
+// the cached manager/sessions -- never a blocking wait on a WinRT async call from the
+// synchronous watchdog Tick handler (the classic STA sync-over-async deadlock the RFC names).
+sealed class MediaInhibitorProvider(Func<bool> isExiting)
+{
+    // Sleep/resume manager-validity leg of the SMTC spike (RFC 0002-environment-levels, "Media
+    // provider (first inhibitor)") is deferred to slice 6's live smoke -- deliberately NOT
+    // pre-built here. If it later shows the cached manager going stale across a sleep/resume
+    // cycle, the RFC's named fix is one `SystemEvents.PowerModeChanged` hook re-running
+    // `InitializeAsync`; `manager` being a plain settable field (not `readonly`) is the seam
+    // that leaves for that fix, without speculatively wiring the hook now.
+    GlobalSystemMediaTransportControlsSessionManager? manager;
+
+    // Threading invariant (RFC 0002-environment-levels, round 3): this continuation must resume
+    // on the UI SynchronizationContext -- no ConfigureAwait(false) -- so the `manager` write
+    // below never races the watchdog tick's synchronous IsActive reads. This relies on the same
+    // mechanism StartWatchingAsync already depends on for `await FaceDetector.CreateAsync()`:
+    // called from the UI thread (WatcherContext's constructor), the default awaiter captures
+    // SynchronizationContext.Current and resumes the continuation there, with no explicit
+    // ui.Post needed.
+    public async Task InitializeAsync()
+    {
+        try
+        {
+            var acquired = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+            // Shutdown-continuation guard (RFC: "a late-completing acquisition continuation
+            // after tray Exit checks the existing shutdown/exiting state before touching any
+            // field and no-ops" -- the RestartProcess-audited-ordering guard class): a slow
+            // RequestAsync that completes after tray Exit/RestartProcess must not resurrect
+            // state on a WatcherContext that is mid-teardown.
+            if (isExiting()) return;
+            manager = acquired;
+        }
+        catch (Exception ex)
+        {
+            // Acquisition failure fails open: IsActive below reports inactive (manager stays
+            // null) rather than the provider ever reporting an inhibited-forever level. Also
+            // covers the SMTC spike's still-open packaged-manifest-capability leg (slice 6 live
+            // smoke): if RequestAsync ever needs a capability this build's manifest lacks, this
+            // provider degrades to permanently-inactive instead of crashing startup.
+            Log.Write($"media inhibitor: session manager acquisition failed: {ex.Message}");
+        }
+    }
+
+    // The Func<bool> query fed into the registered LockInhibitor. Synchronous property reads
+    // only -- no I/O -- so calling this from the watchdog tick's LockInhibitor.Refresh never
+    // blocks. Active iff any session reports PlaybackStatus == Playing (RFC: "Browsers surface
+    // YouTube/Netflix playback there; Spotify and native players likewise"). Before the manager
+    // arrives (acquisition still pending, or failed), reports inactive -- fail-open, matching
+    // LockInhibitor.Refresh's own contract.
+    public bool IsActive() =>
+        manager is not null &&
+        manager.GetSessions().Any(s =>
+            s.GetPlaybackInfo().PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing);
+}
+
 sealed class WatcherContext : ApplicationContext
 {
     Config cfg;
@@ -169,6 +238,13 @@ sealed class WatcherContext : ApplicationContext
     // (`PolicyBridge.ReconciliationStep`'s two-tick hysteresis counter; round-3 boundary rule 1
     // holds this across a failed query rather than resetting it).
     int sessionLockDisagreementCount;
+    // Inhibitor registry (RFC 0002-environment-levels, "Inhibitor registry"): built once in the
+    // constructor from the configured providers (media playback, kill-switch gated -- see
+    // MediaInhibitorProvider). `Refresh()` runs ONLY from the watchdog tick
+    // (`WatchdogTickStep`'s middle step); `BuildStepInputs`/`Advance` read `.Active` and
+    // `.ActiveNames` at any cadence off this cached snapshot -- the cached/slow-cadence
+    // discipline lives in the registry's own type, not in prose here.
+    readonly LockInhibitorRegistry inhibitorRegistry;
     // Presence-stabilization filter (0001-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
     // raw per-frame FaceDetector output flickers false-positive on an empty scene under a
     // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/Advance, so every
@@ -229,6 +305,13 @@ sealed class WatcherContext : ApplicationContext
     int watchdogStrikes;
     bool starting;
     bool settingsOpen;
+    // Shutdown/exiting guard (RFC 0002-environment-levels, "Media provider": "the same guard
+    // class as RestartProcess's audited ordering"): set once, at the start of ExitThreadCore --
+    // reached alike by tray Exit and by RestartProcess's own ExitThread() call, so one flag
+    // covers both. MediaInhibitorProvider.InitializeAsync's continuation checks this before
+    // writing its cached manager field, so a late-completing acquisition after teardown has
+    // begun cannot resurrect state on a WatcherContext that is going away.
+    bool exiting;
     // The shell's own current-sample dark-vs-no-frame knowledge (0001-core-brain.md:
     // "Status.NoSignal does not distinguish dark vs. no-frame ... the shell already computed
     // that distinction itself one line before constructing the Observation"). Set every sample
@@ -360,21 +443,30 @@ sealed class WatcherContext : ApplicationContext
     // The ONE StepInputs-construction site (RFC 0002-environment-levels, "Construction
     // discipline"): used by Advance's input assembly and the startup Policy.start call, always
     // via named arguments -- the mitigation for StepInputs' three adjacent same-typed bools,
-    // where a positional call could silently transpose two of them. LockInhibited is
-    // hard-coded false until slice 5 wires the inhibitor registry aggregate in. This static
-    // overload is the actual `new Core.StepInputs(...)` call site; the instance overload below
-    // and AssembleStartupInputs's caller both route through it, so "exactly one construction
-    // site" holds even though the startup path can't read the instance's live mirror fields
-    // (they don't exist yet when AssembleStartupInputs runs).
-    static Core.StepInputs BuildStepInputs(bool sessionLocked, bool paused, bool lockInhibited, long inputIdleMs) =>
+    // where a positional call could silently transpose two of them. This static overload is the
+    // actual `new Core.StepInputs(...)` call site; the instance overload below and
+    // AssembleStartupInputs's caller both route through it, so "exactly one construction site"
+    // holds even though the startup path can't read the instance's live inhibitor-registry
+    // snapshot (it hasn't run a single Refresh() yet when AssembleStartupInputs runs -- Refresh
+    // rides the watchdog tick, which hasn't fired at startup -- so AssembleStartupInputs keeps
+    // passing the literal `false` that a not-yet-refreshed registry would report anyway).
+    // `internal` (slice 5): the same testability exception AssembleStartupInputs already has,
+    // so `PresenceLock.Tests` can pin the registry-active -> LockInhibited-true sourcing
+    // directly against this helper without a live WatcherContext.
+    internal static Core.StepInputs BuildStepInputs(bool sessionLocked, bool paused, bool lockInhibited, long inputIdleMs) =>
         new(
             sessionLocked: sessionLocked,
             paused: paused,
             lockInhibited: lockInhibited,
             inputIdleMs: inputIdleMs);
 
+    // RFC 0002-environment-levels, "Status": LockInhibited is sourced from the inhibitor
+    // registry's own cached snapshot (slice 5) -- never from Policy.lockInhibited, which exists
+    // for the verification harness/diagnostics only. `inhibitorRegistry.Active` is read fresh
+    // here on every Advance call, matching every other level in StepInputs; only Refresh()
+    // itself is watchdog-tick-cadence.
     Core.StepInputs BuildStepInputs() =>
-        BuildStepInputs(sessionLocked, paused, lockInhibited: false, inputIdleMs: InputIdleMs());
+        BuildStepInputs(sessionLocked, paused, lockInhibited: inhibitorRegistry.Active, inputIdleMs: InputIdleMs());
 
     // Startup input-assembly ordering (RFC 0002-environment-levels, "Construction discipline"
     // pinned test / "Session mirror with reconciliation" startup bullet): pause consume-and-
@@ -403,12 +495,54 @@ sealed class WatcherContext : ApplicationContext
         return (paused, sessionLocked, inputs);
     }
 
+    // Watchdog-tick composition order (RFC 0002-environment-levels, "Advance and timers":
+    // "within one watchdog tick, WTS reconciliation runs first, then inhibitor
+    // Refresh()/aggregation ..., and only then does SamplingWatchdogStep read Policy.status").
+    // The real Tick handler can't be driven under xunit (WinForms Timer, live P/Invoke, live
+    // WinRT) -- mirroring AssembleStartupInputs's precedent, this is a pure orchestrator over
+    // injected delegates whose call order a test can record and assert directly; the real Tick
+    // handler above supplies the real reconciliation/inhibitor-refresh/sampling-watchdog
+    // closures over its own instance state.
+    internal static void WatchdogTickStep(Action reconcile, Action refreshInhibitors, Action runSamplingWatchdogStep)
+    {
+        reconcile();
+        refreshInhibitors();
+        runSamplingWatchdogStep();
+    }
+
     public WatcherContext()
     {
         cfg = Config.Load();
         policyConfig = PolicyBridge.BuildPolicyConfig(cfg);
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
         ui = SynchronizationContext.Current!;
+
+        // Inhibitor registry (RFC 0002-environment-levels, "Inhibitor registry" / "Media
+        // provider"): built here, early -- before watchdogTimer's Tick handler below is even
+        // declared, so `inhibitorRegistry` is a definitely-assigned field at every point that
+        // closure can read it (assigning it later, after the closure's declaration, compiles
+        // identically at runtime but leaves the field's nullable flow-state "maybe unassigned"
+        // at the closure's textual position, which is a real warning worth not having to
+        // reason past on every future change to this constructor). Kill-switch structural
+        // choice: when MediaInhibitorEnabled is false, the media provider is never constructed
+        // and never registered -- rather than registered-but-permanently-queried-and-ignored --
+        // so a disabled inhibitor costs nothing at watchdog cadence and can never appear in
+        // ActiveNames even transiently. Refresh() runs ONLY from the watchdog tick below;
+        // BuildStepInputs/Advance read Active/ActiveNames at any cadence off the cached
+        // snapshot.
+        var inhibitors = new List<LockInhibitor>();
+        if (cfg.MediaInhibitorEnabled)
+        {
+            var mediaProvider = new MediaInhibitorProvider(isExiting: () => exiting);
+            inhibitors.Add(new LockInhibitor("media-playing", mediaProvider.IsActive));
+            // Async-once acquisition, off the tick path (RFC): fired here, at startup, and
+            // awaited to completion by its own continuation -- never invoked from the
+            // synchronous watchdog Tick handler. SynchronizationContext.Current is already `ui`
+            // at this point (set immediately above), so the continuation resumes on the UI
+            // thread per the threading invariant, with no explicit ui.Post needed.
+            _ = mediaProvider.InitializeAsync();
+        }
+        inhibitorRegistry = new LockInhibitorRegistry(inhibitors);
 
         statusItem = new ToolStripMenuItem("Starting…") { Enabled = false };
         lastRenderedStatusText = "Starting…";
@@ -462,60 +596,82 @@ sealed class WatcherContext : ApplicationContext
         watchdogTimer = new WinFormsTimer { Interval = Core.Cadence.WatchdogIntervalMs };
         watchdogTimer.Tick += (_, _) =>
         {
-            // WTS reconciliation runs FIRST (RFC 0002-environment-levels, "Advance and timers":
-            // watchdog tick composition order, slice-4 form -- reconcile, then
-            // SamplingWatchdogStep; the inhibitor-refresh middle step is slice 5, no registry
-            // exists yet) so SamplingWatchdogStep below always reads this tick's corrected
-            // Policy.status, never a stale one.
-            var wtsResult = QuerySessionLocked();
-            var reconciliation = PolicyBridge.ReconciliationStep(
-                mirror: sessionLocked,
-                queriedLocked: wtsResult.Locked,
-                querySucceeded: wtsResult.Succeeded,
-                ticksSinceLastSessionSwitchMirrorChange: ticksSinceLastSessionSwitchMirrorChange,
-                consecutiveDisagreementCount: sessionLockDisagreementCount);
-            sessionLockDisagreementCount = reconciliation.DisagreementCount;
-            if (reconciliation.CorrectionApplied)
-            {
-                // Corrections drive behavior, not just the bool (RFC): mirror update then
-                // Advance(Reconcile), the identical path a live SessionSwitch takes -- timer
-                // stop/start, filter/freshness resets, and KickAcquisitionIfNeeded all ride the
-                // Advance-internal suppression-transition rule by construction, never a
-                // hand-copied chore here. Each correction logs a warning: it is itself a signal
-                // worth seeing (a missed SessionSwitch edge just self-healed).
-                Log.Write($"WARNING: WTS reconciliation correcting sessionLocked mirror " +
-                          $"{sessionLocked} -> {reconciliation.Mirror} (OS query disagreed for two " +
-                          "consecutive watchdog ticks)");
-                sessionLocked = reconciliation.Mirror;
-                Advance(Core.Event.Reconcile);
-            }
-            // One more watchdog interval has now elapsed since the last mirror-changing
-            // SessionSwitch delivery (or since startup, per the field's initial value of 1) --
-            // advanced here, once per tick, after this tick's own reconciliation already read
-            // the pre-increment value.
-            ticksSinceLastSessionSwitchMirrorChange++;
-
-            // Live from cfg (not captured once) so a Settings change to SampleIntervalMs is
-            // picked up on the very next tick.
-            long starvationMs = Math.Max(10L * cfg.SampleIntervalMs, 15000);
-            var verdict = PolicyBridge.SamplingWatchdogStep(
-                expectsSampling: PolicyBridge.ExpectsSampling(Core.Policy.status(state)),
-                nowMs: Environment.TickCount64,
-                lastSamplePassMs: lastSamplePassAt,
-                strikes: watchdogStrikes,
-                starvationMs: starvationMs);
-            watchdogStrikes = verdict.Strikes;
-            lastSamplePassAt = verdict.StampMs;
-            if (verdict.StartSampleTimer)
-            {
-                Log.Write($"sampling watchdog: no completed sample pass for {starvationMs}ms — restarting sample timer");
-                sampleTimer.Start(); // idempotent if already running
-            }
-            else if (verdict.TreatAsCaptureFailed)
-            {
-                Log.Write("sampling watchdog: still starved after self-heal — treating as capture failure");
-                if (Advance(Core.Event.CaptureFailed)) return; // Action.Restart executed — process exiting
-            }
+            // Watchdog-tick composition order, pinned (RFC 0002-environment-levels, "Advance
+            // and timers"): reconcile -> inhibitor Refresh()/aggregation -> SamplingWatchdogStep
+            // -- routed through WatchdogTickStep (see its own comment) so this order is a
+            // unit-tested seam, not merely this lambda's textual layout. Reconciliation runs
+            // FIRST so a WTS correction's Advance(Reconcile) has already landed before inhibitor
+            // refresh runs; inhibitor refresh runs before SamplingWatchdogStep so the watchdog's
+            // starvation verdict always reads this tick's fully corrected Policy.status.
+            WatchdogTickStep(
+                reconcile: () =>
+                {
+                    var wtsResult = QuerySessionLocked();
+                    var reconciliation = PolicyBridge.ReconciliationStep(
+                        mirror: sessionLocked,
+                        queriedLocked: wtsResult.Locked,
+                        querySucceeded: wtsResult.Succeeded,
+                        ticksSinceLastSessionSwitchMirrorChange: ticksSinceLastSessionSwitchMirrorChange,
+                        consecutiveDisagreementCount: sessionLockDisagreementCount);
+                    sessionLockDisagreementCount = reconciliation.DisagreementCount;
+                    if (reconciliation.CorrectionApplied)
+                    {
+                        // Corrections drive behavior, not just the bool (RFC): mirror update then
+                        // Advance(Reconcile), the identical path a live SessionSwitch takes --
+                        // timer stop/start, filter/freshness resets, and KickAcquisitionIfNeeded
+                        // all ride the Advance-internal suppression-transition rule by
+                        // construction, never a hand-copied chore here. Each correction logs a
+                        // warning: it is itself a signal worth seeing (a missed SessionSwitch
+                        // edge just self-healed).
+                        Log.Write($"WARNING: WTS reconciliation correcting sessionLocked mirror " +
+                                  $"{sessionLocked} -> {reconciliation.Mirror} (OS query disagreed for two " +
+                                  "consecutive watchdog ticks)");
+                        sessionLocked = reconciliation.Mirror;
+                        Advance(Core.Event.Reconcile);
+                    }
+                    // One more watchdog interval has now elapsed since the last mirror-changing
+                    // SessionSwitch delivery (or since startup, per the field's initial value of
+                    // 1) -- advanced here, once per tick, after this tick's own reconciliation
+                    // already read the pre-increment value.
+                    ticksSinceLastSessionSwitchMirrorChange++;
+                },
+                refreshInhibitors: () =>
+                {
+                    // On a change, log the transition (RFC: "the log always explains a non-lock")
+                    // then fire Advance(Reconcile) -- the identical corrections-drive-behavior
+                    // contract WTS reconciliation follows above.
+                    if (inhibitorRegistry.Refresh())
+                    {
+                        Log.Write(inhibitorRegistry.Active
+                            ? $"lock inhibitors active: {string.Join(", ", inhibitorRegistry.ActiveNames)}"
+                            : "lock inhibitors cleared");
+                        Advance(Core.Event.Reconcile);
+                    }
+                },
+                runSamplingWatchdogStep: () =>
+                {
+                    // Live from cfg (not captured once) so a Settings change to SampleIntervalMs
+                    // is picked up on the very next tick.
+                    long starvationMs = Math.Max(10L * cfg.SampleIntervalMs, 15000);
+                    var verdict = PolicyBridge.SamplingWatchdogStep(
+                        expectsSampling: PolicyBridge.ExpectsSampling(Core.Policy.status(state)),
+                        nowMs: Environment.TickCount64,
+                        lastSamplePassMs: lastSamplePassAt,
+                        strikes: watchdogStrikes,
+                        starvationMs: starvationMs);
+                    watchdogStrikes = verdict.Strikes;
+                    lastSamplePassAt = verdict.StampMs;
+                    if (verdict.StartSampleTimer)
+                    {
+                        Log.Write($"sampling watchdog: no completed sample pass for {starvationMs}ms — restarting sample timer");
+                        sampleTimer.Start(); // idempotent if already running
+                    }
+                    else if (verdict.TreatAsCaptureFailed)
+                    {
+                        Log.Write("sampling watchdog: still starved after self-heal — treating as capture failure");
+                        Advance(Core.Event.CaptureFailed); // Action.Restart executed => process exiting; nothing follows in this tick either way
+                    }
+                });
         };
         watchdogTimer.Start();
 
@@ -1043,7 +1199,14 @@ sealed class WatcherContext : ApplicationContext
     // re-rendered only when it actually changes (Policy.status is pulled, never pushed).
     void Render(Core.Status status)
     {
-        string text = PolicyBridge.StatusText(status, lastObservationDark);
+        // RFC 0002-environment-levels, "Status": the annotation is appended regardless of which
+        // Status row is showing, and both halves (the bool and the names) are sourced from the
+        // inhibitor registry's own cached snapshot -- never from Policy.lockInhibited (the core
+        // echo exists for the verification harness/diagnostics only). Advance calls step and
+        // this render synchronously back-to-back, so the registry snapshot read here is exactly
+        // as current as it will ever be for this tick.
+        string text = PolicyBridge.AppendInhibitionAnnotation(
+            PolicyBridge.StatusText(status, lastObservationDark), inhibitorRegistry.Active, inhibitorRegistry.ActiveNames);
         if (text != lastRenderedStatusText)
         {
             lastRenderedStatusText = text;
@@ -1231,6 +1394,12 @@ sealed class WatcherContext : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        // Shutdown/exiting guard (RFC 0002-environment-levels, "Media provider"): set FIRST,
+        // before any other teardown step, so a MediaInhibitorProvider.InitializeAsync
+        // continuation that lands concurrently with (or after) this method observes it and
+        // no-ops rather than writing its cached manager field into a WatcherContext that is
+        // going away. Reached alike by tray Exit and by RestartProcess's own ExitThread() call.
+        exiting = true;
         SystemEvents.SessionSwitch -= OnSessionSwitch;
         sampleTimer.Stop();
         watchdogTimer.Stop();

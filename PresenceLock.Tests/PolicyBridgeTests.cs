@@ -1346,3 +1346,325 @@ public class LegacyRestartStampCleanupTests
         }
     }
 }
+
+/// RFC 0002-environment-levels, "Media provider (first inhibitor)": file-only kill switch, no
+/// Settings UI. `SanitizeSensingConfig` rebuilds `Config` field-by-field (never a plain clone),
+/// so an omitted field silently resets to the type's default on every load — this pins that
+/// `MediaInhibitorEnabled` is copied through explicitly, in both directions, exactly like every
+/// other sensing field above.
+public class MediaInhibitorEnabledSanitizeTests
+{
+    [Fact]
+    public void MediaInhibitorEnabled_true_passes_through_untouched()
+    {
+        var sanitized = PolicyBridge.SanitizeSensingConfig(new Config { MediaInhibitorEnabled = true });
+        Assert.True(sanitized.MediaInhibitorEnabled);
+    }
+
+    [Fact]
+    public void MediaInhibitorEnabled_false_passes_through_untouched_not_silently_reset_to_the_default()
+    {
+        var sanitized = PolicyBridge.SanitizeSensingConfig(new Config { MediaInhibitorEnabled = false });
+        Assert.False(sanitized.MediaInhibitorEnabled);
+    }
+}
+
+/// Pure aggregation/change-detection (RFC 0002-environment-levels, "Inhibitor registry", round
+/// 3): extracted out of `LockInhibitorRegistry.Refresh` specifically so these tests can target
+/// `Compute` directly with plain `(string Name, bool Active)` tuples — no `LockInhibitor`/
+/// `Func&lt;bool&gt;` fakes needed.
+public class LockInhibitorAggregationTests
+{
+    [Fact]
+    public void No_providers_is_inactive_with_no_names_and_no_transition_from_an_inactive_baseline()
+    {
+        var (agg, changed) = LockInhibitorAggregation.Compute([], previousActive: false);
+
+        Assert.False(agg.Active);
+        Assert.Empty(agg.ActiveNames);
+        Assert.False(changed);
+    }
+
+    [Fact]
+    public void One_active_provider_among_inactive_ones_is_active_with_only_its_name()
+    {
+        var (agg, changed) = LockInhibitorAggregation.Compute(
+            [("quiet-hours", false), ("media-playing", true)], previousActive: false);
+
+        Assert.True(agg.Active);
+        Assert.Equal(["media-playing"], agg.ActiveNames);
+        Assert.True(changed);
+    }
+
+    [Fact]
+    public void Multiple_active_providers_lists_every_active_name_in_provider_order()
+    {
+        var (agg, changed) = LockInhibitorAggregation.Compute(
+            [("media-playing", true), ("quiet-hours", false), ("presentation-mode", true)],
+            previousActive: true);
+
+        Assert.True(agg.Active);
+        Assert.Equal(["media-playing", "presentation-mode"], agg.ActiveNames);
+        Assert.False(changed); // was already active, still active -> no transition
+    }
+
+    [Fact]
+    public void Transition_from_inactive_to_active_reports_changed()
+    {
+        var (agg, changed) = LockInhibitorAggregation.Compute([("media-playing", true)], previousActive: false);
+
+        Assert.True(agg.Active);
+        Assert.True(changed);
+    }
+
+    [Fact]
+    public void Transition_from_active_to_inactive_reports_changed()
+    {
+        var (agg, changed) = LockInhibitorAggregation.Compute([("media-playing", false)], previousActive: true);
+
+        Assert.False(agg.Active);
+        Assert.True(changed);
+    }
+
+    [Fact]
+    public void No_transition_when_the_aggregate_active_state_is_unchanged_either_way()
+    {
+        var stillInactive = LockInhibitorAggregation.Compute([("media-playing", false)], previousActive: false);
+        var stillActive = LockInhibitorAggregation.Compute([("media-playing", true)], previousActive: true);
+
+        Assert.False(stillInactive.Changed);
+        Assert.False(stillActive.Changed);
+    }
+}
+
+/// `LockInhibitor.Refresh`'s fail-open exception contract (RFC 0002-environment-levels,
+/// "Inhibitor registry"): a throwing query is caught, reported inactive, and never propagates —
+/// "assume active forever" would be the silent-cannot-lock trap in new clothes, and an escaped
+/// exception would take down the entire watchdog tick handler on the UI thread.
+public class LockInhibitorFailOpenTests
+{
+    [Fact]
+    public void A_throwing_query_reports_inactive_and_does_not_propagate()
+    {
+        var inhibitor = new LockInhibitor("flaky", () => throw new InvalidOperationException("zombie session"));
+
+        var ex = Record.Exception(inhibitor.Refresh);
+
+        Assert.Null(ex);
+        Assert.False(inhibitor.Active);
+    }
+
+    [Fact]
+    public void A_succeeding_query_reports_the_queried_value_in_either_direction()
+    {
+        var active = new LockInhibitor("media-playing", () => true);
+        active.Refresh();
+        Assert.True(active.Active);
+
+        var inactive = new LockInhibitor("media-playing", () => false);
+        inactive.Refresh();
+        Assert.False(inactive.Active);
+    }
+
+    [Fact]
+    public void A_query_that_recovers_after_a_prior_throw_reports_active_again()
+    {
+        // Fail-open must not latch: a transient throw must not permanently pin Active=false.
+        bool shouldThrow = true;
+        var inhibitor = new LockInhibitor("flaky", () =>
+        {
+            if (shouldThrow) throw new InvalidOperationException("zombie session");
+            return true;
+        });
+
+        inhibitor.Refresh();
+        Assert.False(inhibitor.Active);
+
+        shouldThrow = false;
+        inhibitor.Refresh();
+        Assert.True(inhibitor.Active);
+    }
+}
+
+/// `LockInhibitorRegistry.Refresh` (RFC 0002-environment-levels, "Inhibitor registry"): fans out
+/// `LockInhibitor.Refresh` over every provider, then delegates to the already-covered
+/// `LockInhibitorAggregation.Compute` for the aggregate/changed verdict. These tests exercise the
+/// fan-out and the cached-snapshot field writes the pure `Compute` tests above cannot reach.
+public class LockInhibitorRegistryTests
+{
+    [Fact]
+    public void Refresh_fans_out_to_every_provider_and_reports_changed_on_the_activating_tick()
+    {
+        var registry = new LockInhibitorRegistry([
+            new LockInhibitor("media-playing", () => true),
+            new LockInhibitor("quiet-hours", () => false),
+        ]);
+
+        bool changed = registry.Refresh();
+
+        Assert.True(changed);
+        Assert.True(registry.Active);
+        Assert.Equal(["media-playing"], registry.ActiveNames);
+    }
+
+    [Fact]
+    public void A_subsequent_refresh_with_no_state_change_reports_not_changed()
+    {
+        var registry = new LockInhibitorRegistry([new LockInhibitor("media-playing", () => true)]);
+
+        Assert.True(registry.Refresh());
+        Assert.False(registry.Refresh());
+    }
+
+    [Fact]
+    public void A_throwing_provider_fails_open_without_hiding_other_active_providers()
+    {
+        var registry = new LockInhibitorRegistry([
+            new LockInhibitor("flaky", () => throw new InvalidOperationException("zombie session")),
+            new LockInhibitor("media-playing", () => true),
+        ]);
+
+        registry.Refresh();
+
+        Assert.True(registry.Active);
+        Assert.Equal(["media-playing"], registry.ActiveNames);
+    }
+
+    [Fact]
+    public void Clearing_the_only_active_provider_reports_changed_and_empties_ActiveNames()
+    {
+        bool playing = true;
+        var registry = new LockInhibitorRegistry([new LockInhibitor("media-playing", () => playing)]);
+        Assert.True(registry.Refresh());
+
+        playing = false;
+        bool changed = registry.Refresh();
+
+        Assert.True(changed);
+        Assert.False(registry.Active);
+        Assert.Empty(registry.ActiveNames);
+    }
+}
+
+/// Shell-side inhibitor annotation (RFC 0002-environment-levels, "Status"): appended whenever the
+/// registry snapshot is active, regardless of which `Status` row is showing — both halves (the
+/// bool and the names) come from the registry, never from `Policy.lockInhibited`.
+public class AppendInhibitionAnnotationTests
+{
+    [Fact]
+    public void Inactive_registry_leaves_the_status_text_unchanged()
+    {
+        Assert.Equal("Watching", PolicyBridge.AppendInhibitionAnnotation("Watching", inhibited: false, activeNames: []));
+    }
+
+    [Fact]
+    public void Active_registry_with_one_name_matches_the_RFCs_pinned_example_exactly()
+    {
+        Assert.Equal(
+            "Watching · lock inhibited (media-playing)",
+            PolicyBridge.AppendInhibitionAnnotation("Watching", inhibited: true, activeNames: ["media-playing"]));
+    }
+
+    [Fact]
+    public void Active_registry_with_multiple_names_joins_them_with_a_comma_and_space()
+    {
+        Assert.Equal(
+            "Watching · lock inhibited (media-playing, presentation-mode)",
+            PolicyBridge.AppendInhibitionAnnotation(
+                "Watching", inhibited: true, activeNames: ["media-playing", "presentation-mode"]));
+    }
+
+    [Fact]
+    public void The_annotation_composes_with_every_Status_row()
+    {
+        // Extends StatusTextExhaustivenessTests' reach (RFC: the annotation shows "regardless of
+        // which row is showing" — NoSignal and inhibition must be visible simultaneously, never
+        // one hiding the other).
+        var allStatusValues = typeof(Core.Status)
+            .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(p => p.PropertyType == typeof(Core.Status))
+            .Select(p => (Core.Status)p.GetValue(null)!)
+            .ToList();
+
+        Assert.NotEmpty(allStatusValues);
+        foreach (var status in allStatusValues)
+        {
+            string baseText = PolicyBridge.StatusText(status, lastObservationDark: false);
+            string annotated = PolicyBridge.AppendInhibitionAnnotation(baseText, inhibited: true, activeNames: ["media-playing"]);
+
+            Assert.StartsWith(baseText, annotated);
+            Assert.EndsWith(" · lock inhibited (media-playing)", annotated);
+
+            // Inactive must never annotate, for every row alike.
+            Assert.Equal(baseText, PolicyBridge.AppendInhibitionAnnotation(baseText, inhibited: false, activeNames: []));
+        }
+    }
+}
+
+/// RFC 0002-environment-levels, "Slices" item 5: "BuildStepInputs sourcing (registry active →
+/// StepInputs.LockInhibited true)". `WatcherContext` itself can't be constructed under xunit
+/// (WinForms), but `BuildStepInputs` — the one `StepInputs`-construction site every call site
+/// routes through — and `LockInhibitorRegistry` are both directly testable; composing them here
+/// proves the same wiring the instance `BuildStepInputs()` overload performs (a one-line forward
+/// of `inhibitorRegistry.Active` via a named argument) without needing a live shell instance.
+public class BuildStepInputsInhibitorSourcingTests
+{
+    [Fact]
+    public void An_active_registry_snapshot_sources_StepInputs_LockInhibited_true()
+    {
+        var registry = new LockInhibitorRegistry([new LockInhibitor("media-playing", () => true)]);
+        registry.Refresh();
+        Assert.True(registry.Active);
+
+        var inputs = WatcherContext.BuildStepInputs(
+            sessionLocked: false, paused: false, lockInhibited: registry.Active, inputIdleMs: 0L);
+
+        Assert.True(inputs.LockInhibited);
+    }
+
+    [Fact]
+    public void An_inactive_registry_snapshot_sources_StepInputs_LockInhibited_false()
+    {
+        var registry = new LockInhibitorRegistry([new LockInhibitor("media-playing", () => false)]);
+        registry.Refresh();
+        Assert.False(registry.Active);
+
+        var inputs = WatcherContext.BuildStepInputs(
+            sessionLocked: false, paused: false, lockInhibited: registry.Active, inputIdleMs: 0L);
+
+        Assert.False(inputs.LockInhibited);
+    }
+}
+
+/// RFC 0002-environment-levels, "Advance and timers": "within one watchdog tick, WTS
+/// reconciliation runs first, then inhibitor Refresh()/aggregation ..., and only then does
+/// SamplingWatchdogStep read Policy.status." `WatcherContext`'s real Tick handler can't be driven
+/// under xunit (WinForms Timer, live P/Invoke, live WinRT) — `WatchdogTickStep` is the pure
+/// orchestrator seam this pins instead, mirroring `AssembleStartupInputsTests`' precedent.
+public class WatchdogTickStepTests
+{
+    [Fact]
+    public void Reconcile_then_refresh_inhibitors_then_sampling_watchdog_run_in_that_exact_order()
+    {
+        var callOrder = new List<string>();
+
+        WatcherContext.WatchdogTickStep(
+            reconcile: () => callOrder.Add("reconcile"),
+            refreshInhibitors: () => callOrder.Add("refresh"),
+            runSamplingWatchdogStep: () => callOrder.Add("watchdog"));
+
+        Assert.Equal(new[] { "reconcile", "refresh", "watchdog" }, callOrder);
+    }
+
+    [Fact]
+    public void Each_step_runs_exactly_once_even_if_earlier_steps_mutate_shared_state()
+    {
+        int calls = 0;
+        WatcherContext.WatchdogTickStep(
+            reconcile: () => calls++,
+            refreshInhibitors: () => calls++,
+            runSamplingWatchdogStep: () => calls++);
+
+        Assert.Equal(3, calls);
+    }
+}

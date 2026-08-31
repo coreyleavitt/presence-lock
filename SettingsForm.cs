@@ -82,6 +82,11 @@ sealed class SettingsForm : Form
             RecoveryFailureThreshold = current.RecoveryFailureThreshold,
             RecoveryCooldownMs = current.RecoveryCooldownMs,
             UpgradeCooldownMs = current.UpgradeCooldownMs,
+            // RFC 0002-environment-levels: also not dialog-editable (file-only kill switch, no
+            // Settings UI by design) -- carried forward unchanged for the identical reason as
+            // the six fields above. Omitting this would let an ordinary Settings save silently
+            // flip a user's `false` back to the type's `true` default.
+            MediaInhibitorEnabled = current.MediaInhibitorEnabled,
         };
         var buttons = new FlowLayoutPanel
         {

@@ -131,6 +131,12 @@ static class PolicyBridge
             RecoveryFailureThreshold = cfg.RecoveryFailureThreshold,
             RecoveryCooldownMs = cfg.RecoveryCooldownMs,
             UpgradeCooldownMs = cfg.UpgradeCooldownMs,
+            // RFC 0002-environment-levels: a bool kill switch has no numeric range to validate,
+            // but it MUST still be copied through explicitly -- this method rebuilds a Config
+            // field-by-field rather than cloning, so an omitted field here would silently reset
+            // a user's `false` back to the type's `true` default on every single load, exactly
+            // the kind of silent-behavior-change this RFC exists to eliminate.
+            MediaInhibitorEnabled = cfg.MediaInhibitorEnabled,
         };
     }
 
@@ -371,6 +377,19 @@ static class PolicyBridge
         _ => throw new UnreachableException(),
     };
 
+    /// Shell-side inhibitor annotation (RFC 0002-environment-levels, "Status"): appended whenever
+    /// the inhibitor registry's cached snapshot is active, REGARDLESS of which `Status` row is
+    /// showing -- e.g. "Watching · lock inhibited (media-playing)", the RFC's own pinned example.
+    /// Both `inhibited` and `activeNames` must be sourced from the registry's own snapshot
+    /// (`LockInhibitorRegistry.Active`/`ActiveNames`), never from `Policy.lockInhibited` — the
+    /// core projection exists for the verification harness/diagnostics only (see the RFC's
+    /// "Status" section for why one annotation needs one owner for both halves). Deliberately a
+    /// separate function from `StatusText` rather than folded into its switch: the annotation is
+    /// orthogonal to the status row, so it composes with every arm uniformly instead of needing
+    /// its own case in an otherwise-exhaustive match.
+    internal static string AppendInhibitionAnnotation(string statusText, bool inhibited, IReadOnlyList<string> activeNames) =>
+        inhibited ? $"{statusText} · lock inhibited ({string.Join(", ", activeNames)})" : statusText;
+
     /// Shared event-construction function (0001-core-brain.md slice 8a: "Factor each call
     /// site's event construction into a small named function... reused unchanged by 8a's
     /// `ShadowAdvance` and 8b's `Advance`"). The shell already computes `haveFrame`/`dark`/
@@ -590,5 +609,87 @@ static class PolicyBridge
         // first restart of either reason had ever fired. Back-compat by construction.
         public long? UpgradeAt { get; init; }
         public bool Paused { get; init; }
+    }
+}
+
+/// One named, cached lock-inhibitor level (RFC 0002-environment-levels, "Inhibitor registry"):
+/// "the entire extension surface for future gates (presentation mode, quiet hours, on-battery
+/// profiles) -- one named, cached level per provider." `Active` is read by `Advance` at any
+/// cadence -- cheap, no I/O; `Refresh()` is called ONLY from the watchdog tick and performs the
+/// (possibly I/O-bound) `query`. Fail-open by contract: a throwing query (WinRT/COM reads can
+/// die with a zombie session -- the RFC's own named failure mode) is caught, logged rate-limited
+/// (the WTS-reconciliation precedent -- see Program.cs's `QuerySessionLocked`), and reported
+/// inactive. "Assume uninhibited" is the safe direction for an inhibitor -- "assume active
+/// forever" would be the silent-cannot-lock trap in new clothes, and an escaped exception would
+/// take down the entire watchdog tick handler on the UI thread, WTS reconciliation and the
+/// sampling watchdog with it. A distinct top-level type rather than a nested `PolicyBridge`
+/// member: unlike everything else in that file, this class is stateful (mutable cached `Active`),
+/// not a pure function -- housing it in the static helper class would blur that distinction.
+internal sealed class LockInhibitor(string name, Func<bool> query)
+{
+    public string Name { get; } = name;
+    public bool Active { get; private set; }
+
+    public void Refresh()
+    {
+        try
+        {
+            Active = query();
+        }
+        catch (Exception ex)
+        {
+            Active = false;
+            // Keyed (not message-keyed) rate limiting, same reasoning as the WTS-query failure
+            // line: a query's exception message can vary run to run, and keying on raw text
+            // would let that variation defeat the rate limit entirely.
+            Log.WriteRateLimited($"inhibitor-{Name}", $"inhibitor {Name} query failed: {ex.Message}");
+        }
+    }
+}
+
+/// The aggregate over every registered `LockInhibitor` (RFC 0002-environment-levels, "Inhibitor
+/// registry"): `Active` iff any provider is active; `ActiveNames` lists which, in provider order.
+/// A plain data carrier -- see `LockInhibitorAggregation.Compute` for the pure logic that
+/// produces one and `LockInhibitorRegistry` for the cached snapshot `Advance`/`StatusText` read.
+internal readonly record struct InhibitorAggregate(bool Active, IReadOnlyList<string> ActiveNames);
+
+/// Pure aggregation/change-detection (RFC 0002-environment-levels, round 3): extracted out of
+/// `LockInhibitorRegistry.Refresh` specifically so it has the same independent, dedicated unit
+/// coverage as `ReconciliationStep`/`SamplingWatchdogStep` -- the house precedent this RFC's own
+/// new code follows. `PresenceLock.Tests` targets `Compute` directly with plain
+/// `(string Name, bool Active)` tuples, no `LockInhibitor`/`Func&lt;bool&gt;` fakes needed;
+/// `Refresh` below keeps only the I/O fan-out (`LockInhibitor.Refresh` calls) and the field
+/// writes.
+internal static class LockInhibitorAggregation
+{
+    internal static (InhibitorAggregate Aggregate, bool Changed) Compute(
+        IReadOnlyList<(string Name, bool Active)> providers, bool previousActive)
+    {
+        var names = providers.Where(p => p.Active).Select(p => p.Name).ToList();
+        bool active = names.Count > 0;
+        return (new InhibitorAggregate(active, names), active != previousActive);
+    }
+}
+
+/// Fans out `Refresh()` over every registered provider, computes the aggregate via
+/// `LockInhibitorAggregation.Compute`, and reports whether the aggregate changed this tick (RFC
+/// 0002-environment-levels, "Inhibitor registry"). Called ONLY from the watchdog tick's
+/// `WatchdogTickStep` middle step; `Advance`/`StatusText` read `.Active`/`.ActiveNames` at any
+/// cadence off this cached snapshot -- the cached/slow-cadence discipline lives in this type,
+/// not in prose (a bare `(string Name, Func&lt;bool&gt; IsActive)[]` registry was considered and
+/// rejected per the RFC: a live-query shape gives no cue that SMTC must not be queried on every
+/// sample tick).
+internal sealed class LockInhibitorRegistry(IReadOnlyList<LockInhibitor> providers)
+{
+    public bool Active { get; private set; }
+    public IReadOnlyList<string> ActiveNames { get; private set; } = [];
+
+    public bool Refresh()
+    {
+        foreach (var p in providers) p.Refresh();
+        var (agg, changed) = LockInhibitorAggregation.Compute(
+            [.. providers.Select(p => (p.Name, p.Active))], Active);
+        (Active, ActiveNames) = (agg.Active, agg.ActiveNames);
+        return changed;
     }
 }
