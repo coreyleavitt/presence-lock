@@ -52,6 +52,13 @@ let observationGen : Gen<Observation> =
           Observation.NoFrame
           Observation.DarkFrame ]
 
+/// RFC 0002-environment-levels, slice 1 (MIGRATE): the four session/pause events
+/// (`SessionLocked`/`SessionUnlocked`/`Paused`/`Resumed`) are no longer generated here --
+/// they are transitional-only in the levels path (decision-state no-ops; see `Policy.dispatch`)
+/// and are deleted from the `Event` DU outright in the contract phase. `Event.Reconcile`
+/// takes their place in the generated alphabet as the "mostly no-op, but re-derives status"
+/// noise case the four old events used to play for the properties that reuse this generator
+/// generically (properties 5, 6, 9, 12 in Tests.fs).
 let eventGen : Gen<Event> =
     Gen.oneof
         [ gen {
@@ -62,10 +69,7 @@ let eventGen : Gen<Event> =
           Gen.constant Event.InitSucceeded
           Gen.map Event.InitFailed Arb.generate<bool>
           Gen.constant Event.CaptureFailed
-          Gen.constant Event.SessionLocked
-          Gen.constant Event.SessionUnlocked
-          Gen.constant Event.Paused
-          Gen.constant Event.Resumed
+          Gen.constant Event.Reconcile
           Gen.constant Event.BetterCameraAvailable ]
 
 /// A normalized face box within the unit frame (0001-core-brain.handoff.md, "Burn-in incident
