@@ -2,5 +2,10 @@ title = "PresenceLock"
 label = "RFC"
 docs_dir = "docs/rfc"
 
+# Push-fed: the hub has no mount for this Windows repo, so the parse runs
+# here and the result is POSTed as a bundle. Token lives at .git/quipu-token
+# (outside the tree), pulled from the same credential oyamel pushes with.
 [hub]
-url = "http://127.0.0.1:8000"
+url = "https://quipu.leavitt.dev"
+project = "presence-lock"
+push = true
