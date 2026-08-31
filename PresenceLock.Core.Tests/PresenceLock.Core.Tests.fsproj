@@ -10,6 +10,8 @@
     <Compile Include="Generators.fs" />
     <Compile Include="Tests.fs" />
     <Compile Include="LevelsTests.fs" />
+    <Compile Include="HarnessModel.fs" />
+    <Compile Include="HarnessTests.fs" />
     <Compile Include="PresenceFilterTests.fs" />
     <Compile Include="FrameFreshnessTests.fs" />
   </ItemGroup>

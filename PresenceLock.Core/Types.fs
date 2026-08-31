@@ -207,6 +207,13 @@ type State =
 type Snapshot =
     { Armed: bool
       InGrace: bool
+      /// Now minus the last grace-baseline reset (RFC 0002-environment-levels, "Verification
+      /// harness": the model-based explorer buckets grace the same zero/mid/past-threshold way
+      /// as away/bad-signal/input-idle, and `InGrace` alone -- a boolean -- can't express that;
+      /// added alongside the pre-existing `AwayForMs`/`NoSignalForMs` raw-elapsed pattern this
+      /// diagnostic-only type already follows. Purely additive: no consumer is broken by a new
+      /// field on a record accessed exclusively by name.
+      GraceForMs: int64
       /// Now minus the last away-baseline reset.
       AwayForMs: int64
       /// 0 while signal is healthy.

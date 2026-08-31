@@ -34,7 +34,10 @@ static class Program
 sealed class Config
 {
     public double AwayThresholdSeconds { get; init; } = 5.0;
-    public int SampleIntervalMs { get; init; } = 500;
+    // RFC 0002-environment-levels, "Verification harness": reads Core.Cadence's single shared
+    // constant rather than a bare literal, so the shell and the test-side environment model can
+    // never drift on the default sample cadence.
+    public int SampleIntervalMs { get; init; } = Core.Cadence.DefaultSampleIntervalMs;
     public double GraceSeconds { get; init; } = 10.0;
     // Also require this much keyboard/mouse idle time before locking, so a
     // detector blinded by bad light can't lock out an actively working user.
@@ -288,7 +291,13 @@ sealed class WatcherContext : ApplicationContext
         // states a no-op inside the pure step, so there is no state in which this timer itself
         // needs to be stopped short of process exit.
         lastSamplePassAt = Environment.TickCount64;
-        watchdogTimer = new WinFormsTimer { Interval = 5000 };
+        // RFC 0002-environment-levels, "Verification harness": reads Core.Cadence's single
+        // shared constant -- the model's Tick delta set derives from the same value, so drift
+        // between "what the shell ticks at" and "what the model explores" is impossible by
+        // construction. `retryTimer` above is acquisition-retry cadence, a different concern
+        // that happens to share the same numeric literal today -- it is NOT the watchdog and is
+        // deliberately left as a bare literal.
+        watchdogTimer = new WinFormsTimer { Interval = Core.Cadence.WatchdogIntervalMs };
         watchdogTimer.Tick += (_, _) =>
         {
             // Live from cfg (not captured once) so a Settings change to SampleIntervalMs is

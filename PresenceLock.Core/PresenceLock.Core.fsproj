@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <Compile Include="Types.fs" />
+    <Compile Include="Cadence.fs" />
     <Compile Include="PresenceFilter.fs" />
     <Compile Include="FrameFreshness.fs" />
     <Compile Include="Policy.fs" />

@@ -271,6 +271,7 @@ module Policy =
             | Some (MonotonicMs sinceMs) -> nowMs - sinceMs
         { Armed = state.Armed
           InGrace = nowMs - graceBaselineMs < config.GraceMs
+          GraceForMs = nowMs - graceBaselineMs
           AwayForMs = nowMs - awayBaselineMs
           NoSignalForMs = noSignalForMs
           InitFailStreak = state.InitFailStreak
