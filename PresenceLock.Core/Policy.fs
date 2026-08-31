@@ -119,10 +119,12 @@ module Policy =
     /// Fully suppression-blind: never reads `LastInputs`/suppression and never writes
     /// `LastInputs`/`CachedStatus` — both are wrapper-owned by `step`'s single tail, which is
     /// thereby the only writer of `LastInputs` and the only caller of status computation.
-    /// Idle is read from `ctx.Inputs.InputIdleMs`, never from an event payload. Failure/
-    /// restart events (`InitFailed`, `CaptureFailed`, `BetterCameraAvailable`) were already
-    /// pause-immune (0001-core-brain.md R2-10), i.e. already suppression-blind, so they carry
-    /// over unchanged.
+    /// Idle is read from `ctx.Inputs.InputIdleMs`, never from an event payload; `LockInhibited`
+    /// is read the same way as a fire-time gate on the `NoFace` arm's `Lock` emission (RFC "Lock
+    /// inhibition") -- both are plain `StepInputs` reads, never state carried across calls.
+    /// Failure/restart events (`InitFailed`, `CaptureFailed`, `BetterCameraAvailable`) were
+    /// already pause-immune (0001-core-brain.md R2-10), i.e. already suppression-blind, so they
+    /// carry over unchanged.
     let private dispatch (config: PolicyConfig, state: State, ctx: StepContext, event: Event) : StepResult =
         let now = ctx.Now
         let nowWall = ctx.NowWall
@@ -142,8 +144,17 @@ module Policy =
             let outOfGrace = nowMs - graceBaselineMs >= config.GraceMs
             let awaySatisfied = nowMs - awayBaselineMs >= config.AwayThresholdMs
             let idleSatisfied = ctx.Inputs.InputIdleMs >= config.InputIdleRequiredMs
+            // Fire-time gate (RFC "Lock inhibition"): symmetric with `idleSatisfied` immediately
+            // above -- both are plain conjuncts on the same final `if`, so their relative order
+            // is immaterial (AND is commutative) and there is no ordering subtlety to pin here.
+            // The gate vetoes only this Action; it never touches `updated` (Armed/AwayBaselineAt/
+            // BadSignalSince are computed identically whether or not this conjunct holds), so the
+            // away clock keeps measuring truth (saturated, not reset) and the decision is
+            // re-derived fresh on every Sample rather than latched -- an inhibited opportunity
+            // leaves no memory for a later, uninhibited Sample to consult.
+            let uninhibited = not ctx.Inputs.LockInhibited
             let action =
-                if updated.Armed && outOfGrace && awaySatisfied && idleSatisfied then
+                if updated.Armed && outOfGrace && awaySatisfied && idleSatisfied && uninhibited then
                     Action.Lock
                 else
                     Action.NoAction
@@ -247,9 +258,10 @@ module Policy =
                 |> withRecomputedStatus (config, ctx.Now) }
 
     /// = `LastInputs.LockInhibited` as of the most recent `step` call; cached like `Status`
-    /// (RFC 0002-environment-levels, "Status"). The fire-time lock GATE itself is a later
-    /// slice -- this slice only carries and projects the field, exactly as pinned:
-    /// `LockInhibited` never influences any decision here.
+    /// (RFC 0002-environment-levels, "Status"). The fire-time lock gate itself lives in
+    /// `dispatch`'s `NoFace` arm (RFC "Lock inhibition") -- this projection is a read-only
+    /// echo for the verification harness (property 13's agreement clause) and diagnostic
+    /// logging; it never itself participates in any decision.
     let lockInhibited (state: State) : bool = state.LastInputs.LockInhibited
 
     /// Computed during `step` and cached in `State` — reflects the world as of the most

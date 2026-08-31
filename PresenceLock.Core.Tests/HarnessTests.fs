@@ -6,18 +6,26 @@ open FsCheck.Xunit
 open PresenceLock.Core
 open PresenceLock.Core.Tests.HarnessModel
 
-/// RFC 0002-environment-levels, "Verification harness" -- slice 2 scope: properties 13 (minus
-/// the `lockInhibited` clause) and 14, the edge-reset postcondition, the incident-sequence
-/// replay, and the exhaustive explorer over `StepUnderTest<'aux>` with both committed mutation
-/// fixtures. Harness check 3 (inhibitor semantics) is slice 3 and is intentionally absent here.
+/// RFC 0002-environment-levels, "Verification harness". Slice 2 landed properties 13 (minus the
+/// `lockInhibited` clause) and 14, the edge-reset postcondition, the incident-sequence replay,
+/// and the exhaustive explorer over `StepUnderTest<'aux>` with both committed mutation fixtures.
+/// Slice 3 activates the `MediaPlaying`/`LockInhibited` axis (`ToggleMediaPlaying` joins the
+/// action alphabet), adds property 13's `lockInhibited` agreement clause, and adds harness
+/// check 3 (inhibitor semantics) -- all inside `HarnessModel.fs`'s `explore`/`assertStatusAgreement`,
+/// exercised transparently by the tests below without needing their own dedicated cases.
 
 /// Depth bound shared by every exploration in this file. Chosen empirically, not arbitrarily:
-/// the real core's reachable graph under this alphabet/config closes (BFS's queue empties
-/// naturally, `MaxDepthReached` < this bound) at depth 11 with 1132 nodes in ~40ms, so 16 gives
-/// slack above the observed fixed point while staying two orders of magnitude under the ~30s
-/// budget -- raising it further cannot find more nodes for the real core, since the graph is
-/// already fully closed; it only matters for a mutant whose own reachable graph might be larger
-/// (neither committed mutant needs it -- both are caught well inside depth 11 too).
+/// the real core's reachable graph under this alphabet/config closed (BFS's queue empties
+/// naturally, `MaxDepthReached` < this bound) at depth 11 with 1132 nodes in ~40ms before slice
+/// 3 activated the `MediaPlaying`/`LockInhibited` axis (`ToggleMediaPlaying` joining the action
+/// alphabet); re-probed after that change, closure now lands at depth 12 with 2272 nodes in
+/// ~120ms -- roughly double the node count, consistent with an independent boolean axis
+/// multiplying the reachable (env x core-state) product, and one deeper because reaching some
+/// inhibited/uninhibited combinations costs one extra toggle. 16 still gives slack above the
+/// re-probed fixed point while staying two orders of magnitude under the ~30s budget -- raising
+/// it further cannot find more nodes for the real core, since the graph is already fully closed;
+/// it only matters for a mutant whose own reachable graph might be larger (neither committed
+/// mutant needs it -- both are caught well inside the fixed point too).
 let private maxDepth = 16
 
 // --------------------------------------------------------------------------------------------
@@ -30,6 +38,7 @@ let private envActionGen: Gen<EnvAction> =
         [ Gen.constant OsLock
           Gen.constant OsUnlock
           Gen.constant TogglePause
+          Gen.constant ToggleMediaPlaying
           Gen.constant ToggleCameraAlive
           Gen.constant ToggleFacePresent
           Gen.constant ToggleInputIdle

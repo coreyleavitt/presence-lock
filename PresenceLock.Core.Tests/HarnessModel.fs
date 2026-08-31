@@ -34,8 +34,10 @@ let realStepUnderTest: StepUnderTest<unit> =
 // --------------------------------------------------------------------------------------------
 
 /// Ground truth (RFC "Verification harness"). `MediaPlaying` feeds `StepInputs.LockInhibited`
-/// but this slice pins it false throughout exploration -- the field exists (forward compat with
-/// slice 3's inhibitor-gate harness check) but no action in this slice's alphabet ever flips it.
+/// and is a live axis from slice 3 onward: `ToggleMediaPlaying` in the action alphabet below
+/// flips it, firing `Reconcile` synchronously at the transition (same fidelity rule as every
+/// other level change), so the explored graph now covers the inhibited/uninhibited product of
+/// every other reachable state, not merely the uninhibited-only graph slice 2 explored.
 type EnvTruth =
     { OsLocked: bool
       Paused: bool
@@ -101,20 +103,25 @@ type World<'aux> =
 // fires a dedicated Reconcile for (only SessionLocked/Paused/LockInhibited are), so they update
 // Env without ever calling into the step under test -- their effect surfaces only at the next
 // Tick-driven Sample (or, for InputIdle, at whatever call next reads `stepInputsOf`).
+// `ToggleMediaPlaying` (slice 3) IS a mirror action, unlike its ground-truth-only siblings above:
+// it feeds `StepInputs.LockInhibited` directly (`stepInputsOf`), and the real shell's inhibitor
+// registry fires `Advance(Reconcile)` synchronously on every aggregate transition -- unlike a
+// pause toggle it carries no lock-screen precondition, since SMTC/media state is independent of
+// session state, so it is legal from every truth.
 // --------------------------------------------------------------------------------------------
 type EnvAction =
     | OsLock
     | OsUnlock
     | TogglePause
+    | ToggleMediaPlaying
     | ToggleCameraAlive
     | ToggleFacePresent
     | ToggleInputIdle
     | Tick of int64
 
 /// Model fidelity (RFC): every level-changing action that IS a StepInputs mirror (OsLock,
-/// OsUnlock, pause toggle -- media toggle joins this list in slice 3) calls the step under test
-/// with `Reconcile` synchronously at the transition, the same `Advance(Reconcile)` contract the
-/// real shell implements.
+/// OsUnlock, pause toggle, media toggle) calls the step under test with `Reconcile` synchronously
+/// at the transition, the same `Advance(Reconcile)` contract the real shell implements.
 let private applyMirrorChange
     (sut: StepUnderTest<'aux>)
     (config: PolicyConfig)
@@ -200,6 +207,7 @@ let apply (sut: StepUnderTest<'aux>) (config: PolicyConfig) (world: World<'aux>)
     | OsUnlock -> None
     | TogglePause when not t.OsLocked -> Some(applyMirrorChange sut config world (fun t -> { t with Paused = not t.Paused }))
     | TogglePause -> None
+    | ToggleMediaPlaying -> Some(applyMirrorChange sut config world (fun t -> { t with MediaPlaying = not t.MediaPlaying }))
     | ToggleCameraAlive -> Some(applyGroundTruthOnly world (fun t -> { t with CameraAlive = not t.CameraAlive }))
     | ToggleFacePresent -> Some(applyGroundTruthOnly world (fun t -> { t with FacePresent = not t.FacePresent }))
     | ToggleInputIdle -> Some(applyToggleInputIdle world)
@@ -213,6 +221,7 @@ let legalActions (t: EnvTruth) (deltas: int64 list) : EnvAction list =
           yield OsUnlock
       if not t.OsLocked then
           yield TogglePause
+      yield ToggleMediaPlaying
       yield ToggleCameraAlive
       yield ToggleFacePresent
       yield ToggleInputIdle
@@ -320,10 +329,14 @@ let initialWorld (sut: StepUnderTest<'aux>) (config: PolicyConfig) : World<'aux>
     { Env = initialEnv; Core = result.State; Aux = aux1 }
 
 // --------------------------------------------------------------------------------------------
-// Property 13 -- status/level agreement (minus the lockInhibited clause; slice 3). Rows 3/4
-// (Recovering/AcquiringCamera) require `not HasSucceededOnce`, which the harness's fixed
-// recovery axes hold permanently false (see `initialWorld`) -- structurally unreachable here,
-// exactly as the RFC's Scope section states, not silently skipped.
+// Property 13 -- status/level agreement, PLUS (slice 3) the `lockInhibited` agreement clause:
+// `Policy.lockInhibited state = inputs.LockInhibited` after every step -- real regression
+// coverage for the `LastInputs` invariant, since `lockInhibited` is a pure echo of
+// `LastInputs.LockInhibited` and can only drift if some call site fails to route the current
+// inputs through `step`'s tail. Rows 3/4 (Recovering/AcquiringCamera) require
+// `not HasSucceededOnce`, which the harness's fixed recovery axes hold permanently false (see
+// `initialWorld`) -- structurally unreachable here, exactly as the RFC's Scope section states,
+// not silently skipped.
 // --------------------------------------------------------------------------------------------
 exception HarnessViolation of string
 
@@ -342,7 +355,7 @@ let assertStatusAgreement (config: PolicyConfig) (world: World<'aux>) (trace: En
         raise (
             HarnessViolation(
                 sprintf
-                    "property 13: expected %A, got %A (truth=%A inputs=%A snap=%A)\nTrace: %s"
+                    "property 13 (status): expected %A, got %A (truth=%A inputs=%A snap=%A)\nTrace: %s"
                     expected
                     actual
                     world.Env.Truth
@@ -351,13 +364,28 @@ let assertStatusAgreement (config: PolicyConfig) (world: World<'aux>) (trace: En
                     (traceString trace)
             )
         )
+    let actualInhibited = Policy.lockInhibited world.Core
+    if actualInhibited <> inputs.LockInhibited then
+        raise (
+            HarnessViolation(
+                sprintf
+                    "property 13 (lockInhibited agreement): expected %b, got %b (truth=%A inputs=%A)\nTrace: %s"
+                    inputs.LockInhibited
+                    actualInhibited
+                    world.Env.Truth
+                    inputs
+                    (traceString trace)
+            )
+        )
 
 // --------------------------------------------------------------------------------------------
 // Property 14 -- protection liveness. From the given world, force (unlocked, unpaused,
 // uninhibited, camera alive, face seen to arm, then absent + idle past the away threshold) and
-// assert the resulting Tick fires Action.Lock. "Uninhibited" already holds by construction this
-// slice (MediaPlaying/LockInhibited pinned false throughout exploration; harness check 3 lands
-// in slice 3), so the drive issues no explicit inhibitor action.
+// assert the resulting Tick fires Action.Lock. `MediaPlaying`/`LockInhibited` is a live axis from
+// slice 3 onward (see `EnvTruth`), so the drive must now explicitly clear it -- without this
+// step, any node reached with the inhibitor active would (correctly, per the slice-3 gate) never
+// produce Action.Lock, and this property would fail on every such node, not because liveness is
+// broken but because the drive stopped forcing every field its own name promises.
 // --------------------------------------------------------------------------------------------
 let driveToLock (sut: StepUnderTest<'aux>) (config: PolicyConfig) (world: World<'aux>) : Action * EnvAction list =
     let steps = ResizeArray<EnvAction>()
@@ -374,6 +402,9 @@ let driveToLock (sut: StepUnderTest<'aux>) (config: PolicyConfig) (world: World<
         doAction OsUnlock |> ignore
     if w.Env.Truth.Paused then
         doAction TogglePause |> ignore
+    // 1b. Uninhibit.
+    if w.Env.Truth.MediaPlaying then
+        doAction ToggleMediaPlaying |> ignore
     // 2. Camera alive.
     if not w.Env.Truth.CameraAlive then
         doAction ToggleCameraAlive |> ignore
@@ -412,6 +443,80 @@ let assertProtectionLiveness (sut: StepUnderTest<'aux>) (config: PolicyConfig) (
         )
 
 // --------------------------------------------------------------------------------------------
+// Harness check 3 -- inhibitor semantics (RFC "Verification harness"): from the given world,
+// drive to (unlocked, unpaused, camera alive, face seen to arm, then absent + idle past every
+// remaining threshold) while INHIBITED, and assert Lock never fires -- neither on the Tick that
+// crosses every threshold while still inhibited, nor on the Reconcile that announces the
+// inhibitor clearing (a lock decision needs a current observation, which Reconcile never
+// carries). Then assert the very next Sample, still absent, fires Lock -- bounded by one sample
+// interval, mirroring `driveToLock`'s own final step exactly but with the inhibitor as the one
+// remaining gate to clear.
+// --------------------------------------------------------------------------------------------
+let driveInhibitorSemantics
+    (sut: StepUnderTest<'aux>)
+    (config: PolicyConfig)
+    (world: World<'aux>)
+    : Action * Action * Action * EnvAction list =
+    let steps = ResizeArray<EnvAction>()
+    let mutable w = world
+    let doAction (a: EnvAction) : Action =
+        match apply sut config w a with
+        | Some(w', act) ->
+            steps.Add a
+            w <- w'
+            act
+        | None -> failwithf "harness check 3 drive: illegal action %A from truth %A" a w.Env.Truth
+    // 1. Unsuppress -- unlock first, then unpause (pause toggle requires an unlocked session).
+    if w.Env.Truth.OsLocked then
+        doAction OsUnlock |> ignore
+    if w.Env.Truth.Paused then
+        doAction TogglePause |> ignore
+    // 2. Camera alive.
+    if not w.Env.Truth.CameraAlive then
+        doAction ToggleCameraAlive |> ignore
+    // 3. Inhibit -- from a clean edge, so the Reconcile below fires exactly at the transition.
+    if w.Env.Truth.MediaPlaying then
+        doAction ToggleMediaPlaying |> ignore
+    doAction ToggleMediaPlaying |> ignore
+    // 4. Face seen to arm -- a clean off/on edge, then a tiny tick delivers FaceSeen.
+    if w.Env.Truth.FacePresent then
+        doAction ToggleFacePresent |> ignore
+    doAction ToggleFacePresent |> ignore
+    doAction (Tick 1L) |> ignore
+    // 5. Absent again.
+    doAction ToggleFacePresent |> ignore
+    // 6. Idle, from a clean edge so the idle clock starts at exactly "now".
+    if w.Env.Truth.InputIdle then
+        doAction ToggleInputIdle |> ignore
+    doAction ToggleInputIdle |> ignore
+    // 7. One tick past every remaining threshold at once, while still inhibited -- must NOT lock.
+    let snap = Policy.snapshot (config, w.Core, MonotonicMs w.Env.Now)
+    let graceRemaining = max 0L (config.GraceMs - snap.GraceForMs)
+    let delta = List.max [ graceRemaining; config.AwayThresholdMs; config.InputIdleRequiredMs ] + 1L
+    let duringInhibitionAction = doAction (Tick delta)
+    // 8. Clear the inhibitor -- the announcing Reconcile must not lock either.
+    let clearingAction = doAction ToggleMediaPlaying
+    // 9. The very next Sample, still absent, must lock -- one full sample interval, matching the
+    // real shell's cadence rather than an arbitrary small delta.
+    let nextSampleAction = doAction (Tick(int64 Cadence.DefaultSampleIntervalMs))
+    duringInhibitionAction, clearingAction, nextSampleAction, List.ofSeq steps
+
+let assertInhibitorSemantics (sut: StepUnderTest<'aux>) (config: PolicyConfig) (world: World<'aux>) (trace: EnvAction list) : unit =
+    let duringInhibition, clearing, nextSample, driveSteps = driveInhibitorSemantics sut config world
+    let fail msg =
+        raise (HarnessViolation(sprintf "%s\nTrace: drive steps %A (from %s)" msg driveSteps (traceString trace)))
+    if duringInhibition = Action.Lock then
+        fail "harness check 3: Lock fired while LockInhibited was active and every other threshold was past"
+    if clearing = Action.Lock then
+        fail "harness check 3: Lock fired on the Reconcile that announced the inhibitor clearing"
+    if nextSample <> Action.Lock then
+        fail (
+            sprintf
+                "harness check 3: expected Lock on the next Sample after the inhibitor cleared, still absent, got %A"
+                nextSample
+        )
+
+// --------------------------------------------------------------------------------------------
 // Edge-reset postcondition (RFC property 14's complementary check): at every suppressed ->
 // unsuppressed edge the explorer takes, the reset's full postcondition holds.
 // --------------------------------------------------------------------------------------------
@@ -430,8 +535,9 @@ let assertEdgeResetPostcondition (config: PolicyConfig) (world: World<'aux>) (tr
 
 // --------------------------------------------------------------------------------------------
 // Exhaustive explorer: BFS over the reachable (env x abstracted-core-state) graph, depth-bounded,
-// dedup'd via `keyOf`, asserting property 13 + property 14 at every node and the edge-reset
-// postcondition at every suppressed -> unsuppressed transition it takes. Full path-provenance
+// dedup'd via `keyOf`, asserting property 13 + property 14 + harness check 3 (inhibitor
+// semantics, slice 3) at every node and the edge-reset postcondition at every suppressed ->
+// unsuppressed transition it takes. Full path-provenance
 // tracking is deliberately not attempted beyond one path per node (the first BFS finds) --
 // exactly enough to print a trace on violation, per the RFC ("Full path-provenance tracking
 // inside the BFS is explicitly not required -- it would fight the dedup that keeps the graph
@@ -458,6 +564,7 @@ let explore<'aux when 'aux: equality> (sut: StepUnderTest<'aux>) (config: Policy
         maxDepthSeen <- max maxDepthSeen depth
         assertStatusAgreement config world trace
         assertProtectionLiveness sut config world trace
+        assertInhibitorSemantics sut config world trace
 
         if depth < maxDepth then
             for action in legalActions world.Env.Truth deltas do

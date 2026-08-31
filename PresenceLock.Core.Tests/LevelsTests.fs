@@ -241,3 +241,99 @@ let ``Reconcile never emits Lock even when away/idle conditions would satisfy a 
     let sampleResult =
         Policy.step (someConfig, armedResult.State, ctx farNow idleInputs, Event.Sample(Observation.NoFace))
     Assert.Equal(Action.Lock, sampleResult.Action)
+
+// --- Lock inhibition: fire-time gate on the NoFace arm's Lock emission, symmetric with the
+// existing input-idle gate (RFC "Lock inhibition") -----------------------------------------
+
+[<Fact>]
+let ``an active LockInhibited vetoes Lock when armed and grace/away/idle are all past threshold, and the away clock keeps measuring instead of resetting`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps, unsuppressedInputs)
+    let initResult = Policy.step (someConfig, state, ctx 0L unsuppressedInputs, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, ctx 0L unsuppressedInputs, Event.Sample(Observation.FaceSeen))
+    let farNow = someConfig.GraceMs + someConfig.AwayThresholdMs + 1L
+    let inhibitedIdleInputs =
+        { unsuppressedInputs with
+            LockInhibited = true
+            InputIdleMs = someConfig.InputIdleRequiredMs }
+    let lockResult =
+        Policy.step (someConfig, armedResult.State, ctx farNow inhibitedIdleInputs, Event.Sample(Observation.NoFace))
+    Assert.Equal(Action.NoAction, lockResult.Action)
+    // Away clock kept measuring truth (still baselined at the FaceSeen's `now` = 0), not
+    // saturated-then-reset by the veto -- "saturated, not reset" per the RFC.
+    let snap = Policy.snapshot (someConfig, lockResult.State, MonotonicMs farNow)
+    Assert.Equal(farNow, snap.AwayForMs)
+    Assert.True(snap.AwayForMs >= someConfig.AwayThresholdMs)
+
+[<Fact>]
+let ``clearing the inhibitor while still absent does not lock via the announcing Reconcile, but locks on the very next Sample`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps, unsuppressedInputs)
+    let initResult = Policy.step (someConfig, state, ctx 0L unsuppressedInputs, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, ctx 0L unsuppressedInputs, Event.Sample(Observation.FaceSeen))
+    let farNow = someConfig.GraceMs + someConfig.AwayThresholdMs + 1L
+    let idleInputs = { unsuppressedInputs with InputIdleMs = someConfig.InputIdleRequiredMs }
+    let inhibitedIdleInputs = { idleInputs with LockInhibited = true }
+    let inhibitedResult =
+        Policy.step (someConfig, armedResult.State, ctx farNow inhibitedIdleInputs, Event.Sample(Observation.NoFace))
+    Assert.Equal(Action.NoAction, inhibitedResult.Action)
+    // Inhibitor clears -- the shell announces it via Reconcile, which must NOT lock: a lock
+    // decision needs a current observation, and Reconcile carries none.
+    let reconcileResult =
+        Policy.step (someConfig, inhibitedResult.State, ctx (farNow + 1L) idleInputs, Event.Reconcile)
+    Assert.Equal(Action.NoAction, reconcileResult.Action)
+    // The very next Sample, still absent, fires the lock -- bounded by one sample interval.
+    let sampleResult =
+        Policy.step (someConfig, reconcileResult.State, ctx (farNow + 2L) idleInputs, Event.Sample(Observation.NoFace))
+    Assert.Equal(Action.Lock, sampleResult.Action)
+
+[<Fact>]
+let ``an active inhibitor changes only the emitted Action, never Armed, grace/away baselines, or signal health`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps, unsuppressedInputs)
+    let initResult = Policy.step (someConfig, state, ctx 0L unsuppressedInputs, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, ctx 0L unsuppressedInputs, Event.Sample(Observation.FaceSeen))
+    let farNow = someConfig.GraceMs + someConfig.AwayThresholdMs + 1L
+    let idleInputs = { unsuppressedInputs with InputIdleMs = someConfig.InputIdleRequiredMs }
+    let inhibitedInputs = { idleInputs with LockInhibited = true }
+    // Same state, same instant, differing only in LockInhibited -- isolates the gate's effect
+    // from everything else NoFace already does (BadSignalSince clearing, etc).
+    let inhibitedResult =
+        Policy.step (someConfig, armedResult.State, ctx farNow inhibitedInputs, Event.Sample(Observation.NoFace))
+    let uninhibitedResult =
+        Policy.step (someConfig, armedResult.State, ctx farNow idleInputs, Event.Sample(Observation.NoFace))
+    Assert.Equal(Action.NoAction, inhibitedResult.Action)
+    Assert.Equal(Action.Lock, uninhibitedResult.Action)
+    let inhibitedSnap = Policy.snapshot (someConfig, inhibitedResult.State, MonotonicMs farNow)
+    let uninhibitedSnap = Policy.snapshot (someConfig, uninhibitedResult.State, MonotonicMs farNow)
+    Assert.Equal(uninhibitedSnap.Armed, inhibitedSnap.Armed)
+    Assert.Equal(uninhibitedSnap.InGrace, inhibitedSnap.InGrace)
+    Assert.Equal(uninhibitedSnap.GraceForMs, inhibitedSnap.GraceForMs)
+    Assert.Equal(uninhibitedSnap.AwayForMs, inhibitedSnap.AwayForMs)
+    Assert.Equal(uninhibitedSnap.NoSignalForMs, inhibitedSnap.NoSignalForMs)
+
+[<Fact>]
+let ``an inhibited lock opportunity is not latched -- it is re-derived fresh and fires exactly once after the inhibitor clears`` () =
+    let state = Policy.start (MonotonicMs 0L, noStamps, unsuppressedInputs)
+    let initResult = Policy.step (someConfig, state, ctx 0L unsuppressedInputs, Event.InitSucceeded)
+    let armedResult =
+        Policy.step (someConfig, initResult.State, ctx 0L unsuppressedInputs, Event.Sample(Observation.FaceSeen))
+    let idleInputs = { unsuppressedInputs with InputIdleMs = someConfig.InputIdleRequiredMs }
+    let inhibitedInputs = { idleInputs with LockInhibited = true }
+    let farNow = someConfig.GraceMs + someConfig.AwayThresholdMs + 1L
+    // Two would-be-lock samples in a row while inhibited -- each individually vetoed; nothing
+    // is remembered ("missed lock count", etc) that would fire twice once cleared.
+    let firstInhibited =
+        Policy.step (someConfig, armedResult.State, ctx farNow inhibitedInputs, Event.Sample(Observation.NoFace))
+    Assert.Equal(Action.NoAction, firstInhibited.Action)
+    let secondInhibited =
+        Policy.step (someConfig, firstInhibited.State, ctx (farNow + 500L) inhibitedInputs, Event.Sample(Observation.NoFace))
+    Assert.Equal(Action.NoAction, secondInhibited.Action)
+    // Clearing via Reconcile still must not lock.
+    let reconcileResult =
+        Policy.step (someConfig, secondInhibited.State, ctx (farNow + 501L) idleInputs, Event.Reconcile)
+    Assert.Equal(Action.NoAction, reconcileResult.Action)
+    // The next Sample re-derives the decision fresh against current truth and locks exactly once.
+    let lockResult =
+        Policy.step (someConfig, reconcileResult.State, ctx (farNow + 502L) idleInputs, Event.Sample(Observation.NoFace))
+    Assert.Equal(Action.Lock, lockResult.Action)
