@@ -892,6 +892,407 @@ public class RestartStampsPersistenceTests
     }
 }
 
+/// Consequences of one before/after `Status` pair across an `Advance` call (RFC
+/// 0002-environment-levels, "Advance and timers", round 3). Extracted as a pure function so
+/// the sample-timer restart decision on a WTS-correction-driven unlock — which the
+/// verification harness cannot see, since it models `step` semantics, not WinForms timers —
+/// is independently testable here.
+public class SuppressionTransitionStepTests
+{
+    [Fact]
+    public void A_suppressed_to_unsuppressed_transition_resets_filters_restarts_sampling_and_kicks_acquisition()
+    {
+        var verdict = PolicyBridge.SuppressionTransitionStep(Core.Status.SessionLocked, Core.Status.Watching);
+
+        Assert.True(verdict.ResetFilters);
+        Assert.True(verdict.RestartSampleTimer);
+        Assert.True(verdict.KickAcquisition);
+        Assert.False(verdict.StopSampleTimer);
+        Assert.NotNull(verdict.TransitionLogMessage);
+        Assert.StartsWith("suppression exited:", verdict.TransitionLogMessage);
+    }
+
+    [Fact]
+    public void An_unsuppressed_to_suppressed_transition_stops_sampling_only()
+    {
+        var verdict = PolicyBridge.SuppressionTransitionStep(Core.Status.Watching, Core.Status.Paused);
+
+        Assert.False(verdict.ResetFilters);
+        Assert.False(verdict.RestartSampleTimer);
+        Assert.False(verdict.KickAcquisition);
+        Assert.True(verdict.StopSampleTimer);
+        Assert.NotNull(verdict.TransitionLogMessage);
+        Assert.StartsWith("suppression entered:", verdict.TransitionLogMessage);
+    }
+
+    [Fact]
+    public void No_transition_when_suppression_state_is_unchanged_either_way()
+    {
+        var stillUnsuppressed = PolicyBridge.SuppressionTransitionStep(Core.Status.Watching, Core.Status.NoSignal);
+        var stillSuppressed = PolicyBridge.SuppressionTransitionStep(Core.Status.Paused, Core.Status.SessionLocked);
+
+        foreach (var verdict in new[] { stillUnsuppressed, stillSuppressed })
+        {
+            Assert.False(verdict.ResetFilters);
+            Assert.False(verdict.RestartSampleTimer);
+            Assert.False(verdict.KickAcquisition);
+            Assert.False(verdict.StopSampleTimer);
+            Assert.Null(verdict.TransitionLogMessage);
+        }
+    }
+}
+
+/// `WTSINFOEX.SessionFlags` interpretation (RFC 0002-environment-levels, "Session mirror with
+/// reconciliation", spike deliverable): documented Windows 8+ semantics confirmed live on this
+/// machine (Windows 11 26200) against a demonstrably unlocked console session. Pure and
+/// separated from the P/Invoke call itself so this is the one piece of the query path testable
+/// without a live WTS handle.
+public class InterpretSessionFlagsTests
+{
+    [Fact]
+    public void WTS_SESSIONSTATE_LOCK_zero_reports_succeeded_and_locked()
+    {
+        var result = PolicyBridge.InterpretSessionFlags(0);
+        Assert.True(result.Succeeded);
+        Assert.True(result.Locked);
+    }
+
+    [Fact]
+    public void WTS_SESSIONSTATE_UNLOCK_one_reports_succeeded_and_unlocked()
+    {
+        var result = PolicyBridge.InterpretSessionFlags(1);
+        Assert.True(result.Succeeded);
+        Assert.False(result.Locked);
+    }
+
+    [Fact]
+    public void WTS_SESSIONSTATE_UNKNOWN_negative_one_fails_open_rather_than_guessing_a_lock_state()
+    {
+        var result = PolicyBridge.InterpretSessionFlags(-1);
+        Assert.False(result.Succeeded);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(42)]
+    [InlineData(int.MinValue)]
+    public void Any_other_unrecognized_value_also_fails_open(int sessionFlags)
+    {
+        Assert.False(PolicyBridge.InterpretSessionFlags(sessionFlags).Succeeded);
+    }
+}
+
+/// Round-3 boundary rule 2's companion (RFC 0002-environment-levels, "Session mirror with
+/// reconciliation"): whether one `SessionSwitch` delivery restarts the reconciliation skip
+/// window. Kept as its own tiny pure function, separate from `ReconciliationStep`, so this
+/// specific correctness rule — an idempotent duplicate delivery must NOT restart the window —
+/// has its own dedicated unit test rather than being trusted to a single `if` in
+/// `OnSessionSwitch`.
+public class SessionSwitchTicksAfterDeliveryTests
+{
+    [Fact]
+    public void A_mirror_value_changing_delivery_resets_ticks_to_zero()
+    {
+        Assert.Equal(0, PolicyBridge.SessionSwitchTicksAfterDelivery(mirrorValueChanged: true, currentTicks: 7));
+    }
+
+    [Fact]
+    public void An_idempotent_duplicate_delivery_leaves_the_ticks_counter_unchanged()
+    {
+        // Windows demonstrably double-fires SessionSwitch (0001-core-brain.md): a duplicate
+        // delivery that did NOT change the mirror must not restart the skip window, or a stuck
+        // mirror's heal could be pushed out indefinitely under unrelated session traffic.
+        Assert.Equal(7, PolicyBridge.SessionSwitchTicksAfterDelivery(mirrorValueChanged: false, currentTicks: 7));
+    }
+}
+
+/// The pure WTS-reconciliation decision (RFC 0002-environment-levels, "Session mirror with
+/// reconciliation"), extracted per the RFC's explicit instruction, mirroring the
+/// `SamplingWatchdogStep` precedent. Covers, at minimum, every case the RFC names by name:
+/// fail-open on query failure, correction on exactly the second disagreeing tick, a failed
+/// query interleaved between two disagreeing ticks, an idempotent duplicate `SessionSwitch`
+/// not restarting the skip window, skip-window suppression, and the compounding
+/// skip-plus-hysteresis worst case behind the ~three-watchdog-interval bound.
+public class ReconciliationStepTests
+{
+    [Fact]
+    public void Fail_open_on_query_failure_never_sets_locked_true_and_holds_the_counter()
+    {
+        // Mirror is unlocked; the OS query claims locked, but the query itself failed. A
+        // failed query must NEVER set locked=true (RFC: "defaulting broken data to 'locked'
+        // would silently suppress protection — the fail-closed dim-light mistake in new
+        // clothes"). Round-3 boundary rule 1: the counter is HELD, not reset and not
+        // incremented.
+        var verdict = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: false,
+            ticksSinceLastSessionSwitchMirrorChange: 10, consecutiveDisagreementCount: 1);
+
+        Assert.False(verdict.Mirror);
+        Assert.Equal(1, verdict.DisagreementCount);
+        Assert.False(verdict.CorrectionApplied);
+    }
+
+    [Fact]
+    public void Correction_applies_on_exactly_the_second_disagreeing_tick_not_the_first_or_third()
+    {
+        var first = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 5, consecutiveDisagreementCount: 0);
+        Assert.False(first.CorrectionApplied);
+        Assert.False(first.Mirror);
+        Assert.Equal(1, first.DisagreementCount);
+
+        var second = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 5, consecutiveDisagreementCount: first.DisagreementCount);
+        Assert.True(second.CorrectionApplied);
+        Assert.True(second.Mirror);
+        Assert.Equal(0, second.DisagreementCount);
+
+        // Third tick: mirror is already corrected, so the OS query now AGREES — no further
+        // correction fires (proving the second tick didn't leave anything pending).
+        var third = PolicyBridge.ReconciliationStep(
+            mirror: second.Mirror, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 5, consecutiveDisagreementCount: second.DisagreementCount);
+        Assert.False(third.CorrectionApplied);
+        Assert.Equal(0, third.DisagreementCount);
+    }
+
+    [Fact]
+    public void A_failed_query_interleaved_between_two_disagreeing_ticks_holds_the_counter_costing_exactly_one_extra_tick()
+    {
+        var tick1 = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 5, consecutiveDisagreementCount: 0);
+        Assert.False(tick1.CorrectionApplied);
+        Assert.Equal(1, tick1.DisagreementCount);
+
+        // Query fails: counter HELD at 1 — neither reset to 0 nor incremented to 2. A
+        // reset-on-failure reading would let an intermittent-failure pattern starve the heal
+        // forever.
+        var tick2 = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: false,
+            ticksSinceLastSessionSwitchMirrorChange: 5, consecutiveDisagreementCount: tick1.DisagreementCount);
+        Assert.False(tick2.CorrectionApplied);
+        Assert.Equal(1, tick2.DisagreementCount);
+
+        // Disagreement resumes: this is the SECOND disagreeing tick (the failed tick didn't
+        // count against the streak), so correction applies now — one extra tick overall (3
+        // ticks instead of 2), never a restarted count.
+        var tick3 = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 5, consecutiveDisagreementCount: tick2.DisagreementCount);
+        Assert.True(tick3.CorrectionApplied);
+        Assert.True(tick3.Mirror);
+    }
+
+    [Fact]
+    public void An_idempotent_duplicate_SessionSwitch_does_not_restart_the_skip_window()
+    {
+        // Composes with SessionSwitchTicksAfterDelivery (the shell's actual tracking function):
+        // a genuine change resets ticks to zero; one real watchdog interval elapses; then an
+        // idempotent duplicate SessionSwitch delivery must NOT reset it back to zero.
+        int afterGenuineChange = PolicyBridge.SessionSwitchTicksAfterDelivery(mirrorValueChanged: true, currentTicks: 99);
+        int afterOneRealInterval = afterGenuineChange + 1;
+        int afterDuplicateDelivery = PolicyBridge.SessionSwitchTicksAfterDelivery(mirrorValueChanged: false, currentTicks: afterOneRealInterval);
+        Assert.Equal(1, afterDuplicateDelivery); // NOT restarted back to 0 by the duplicate
+
+        // With the window correctly not restarted, reconciliation at this tick count is no
+        // longer skipped — the disagreement counter moves on this tick.
+        var verdict = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: afterDuplicateDelivery, consecutiveDisagreementCount: 0);
+        Assert.False(verdict.CorrectionApplied); // first disagreeing tick, hysteresis not yet met
+        Assert.Equal(1, verdict.DisagreementCount); // moved -- proof it was not skipped
+    }
+
+    [Fact]
+    public void Skip_window_suppresses_reconciliation_entirely_even_with_a_real_disagreement()
+    {
+        var verdict = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 0, consecutiveDisagreementCount: 0);
+
+        Assert.False(verdict.Mirror);
+        Assert.Equal(0, verdict.DisagreementCount); // untouched -- "skipped entirely"
+        Assert.False(verdict.CorrectionApplied);
+    }
+
+    [Fact]
+    public void The_compounding_skip_plus_hysteresis_worst_case_corrects_within_three_watchdog_ticks()
+    {
+        // RFC: "worst case one SessionSwitch-adjacency skip window plus two hysteresis ticks
+        // ~= three watchdog intervals" — conditional on bounded consecutive query failures
+        // (zero failures here; the interleaved-failure test above shows the +1-tick extension
+        // per failure).
+        var tick1 = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 0, consecutiveDisagreementCount: 0);
+        Assert.False(tick1.CorrectionApplied);
+        Assert.Equal(0, tick1.DisagreementCount);
+
+        var tick2 = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 1, consecutiveDisagreementCount: tick1.DisagreementCount);
+        Assert.False(tick2.CorrectionApplied);
+        Assert.Equal(1, tick2.DisagreementCount);
+
+        var tick3 = PolicyBridge.ReconciliationStep(
+            mirror: false, queriedLocked: true, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 2, consecutiveDisagreementCount: tick2.DisagreementCount);
+        Assert.True(tick3.CorrectionApplied); // corrected on the third watchdog tick, not before
+        Assert.True(tick3.Mirror);
+    }
+}
+
+/// The startup input-assembly ordering pin (RFC 0002-environment-levels, "Construction
+/// discipline" pinned test / "Session mirror with reconciliation" startup bullet): the
+/// constructor itself can't be driven under xunit (WinForms/WinRT construction), so
+/// `WatcherContext.AssembleStartupInputs` is the extracted seam — a pure orchestrator over
+/// injected delegates whose call order this test records and asserts directly, pinning that
+/// pause consume-and-clear runs before the WTS query, which runs before any `StepInputs` is
+/// assembled. A misordered constructor would fail SILENTLY as "unsuppressed" — exactly the
+/// class of defect this pin exists to catch.
+public class AssembleStartupInputsTests
+{
+    [Fact]
+    public void Consume_then_query_then_read_idle_run_in_that_exact_order()
+    {
+        var callOrder = new List<string>();
+
+        var result = WatcherContext.AssembleStartupInputs(
+            consumePersistedPausedFlag: () => { callOrder.Add("consume"); return true; },
+            queryWtsSessionLocked: () =>
+            {
+                callOrder.Add("query");
+                return new PolicyBridge.WtsLockQueryResult(Succeeded: true, Locked: true);
+            },
+            readInputIdleMs: () => { callOrder.Add("idle"); return 4242L; });
+
+        Assert.Equal(new[] { "consume", "query", "idle" }, callOrder);
+        Assert.True(result.Paused);
+        Assert.True(result.SessionLocked);
+        Assert.True(result.Inputs.Paused);
+        Assert.True(result.Inputs.SessionLocked);
+        Assert.False(result.Inputs.LockInhibited);
+        Assert.Equal(4242L, result.Inputs.InputIdleMs);
+    }
+
+    [Fact]
+    public void A_failed_WTS_query_fails_open_to_an_unlocked_mirror_even_if_the_payload_claims_locked()
+    {
+        // RFC: "a failed query never sets locked=true" — pinned at the startup path too, not
+        // only the watchdog-tick path.
+        var result = WatcherContext.AssembleStartupInputs(
+            consumePersistedPausedFlag: () => false,
+            queryWtsSessionLocked: () => new PolicyBridge.WtsLockQueryResult(Succeeded: false, Locked: true),
+            readInputIdleMs: () => 0L);
+
+        Assert.False(result.SessionLocked);
+        Assert.False(result.Inputs.SessionLocked);
+    }
+
+    [Fact]
+    public void A_successful_query_reporting_unlocked_yields_an_unsuppressed_startup_mirror()
+    {
+        var result = WatcherContext.AssembleStartupInputs(
+            consumePersistedPausedFlag: () => false,
+            queryWtsSessionLocked: () => new PolicyBridge.WtsLockQueryResult(Succeeded: true, Locked: false),
+            readInputIdleMs: () => 0L);
+
+        Assert.False(result.Paused);
+        Assert.False(result.SessionLocked);
+    }
+}
+
+/// RFC 0002-environment-levels, slice 4: "a shell test asserts sampling resumes after a
+/// WTS-correction-driven unlock ... the harness models `step`, not WinForms timers — this leg
+/// only a shell test can pin." The real `WatcherContext` can't be driven under xunit, so this
+/// composes the real pieces the correction path actually runs through —
+/// `PolicyBridge.ReconciliationStep`, the real `Core.Policy.step`, and
+/// `PolicyBridge.SuppressionTransitionStep` — proving the sample-timer RESTART DECISION is
+/// reached, not merely that some `Advance`-shaped function was invoked. Only the literal
+/// WinForms `sampleTimer.Start()` call itself stays outside this seam, per the RFC's own
+/// guidance ("the WinForms Timer.Start call itself may stay one thin layer outside the seam").
+public class WtsCorrectionResumesSamplingTests
+{
+    [Fact]
+    public void A_WTS_correction_driven_unlock_reaches_the_sample_timer_restart_decision()
+    {
+        var config = PolicyBridge.BuildPolicyConfig(new Config());
+
+        // A restart-while-locked process: the startup mirror is locked.
+        var startInputs = new Core.StepInputs(sessionLocked: true, paused: false, lockInhibited: false, inputIdleMs: 0L);
+        var state = Core.Policy.start(
+            Core.MonotonicMs.NewMonotonicMs(0),
+            new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null),
+            startInputs);
+        var previousStatus = Core.Policy.status(state);
+        Assert.Equal(Core.Status.SessionLocked, previousStatus);
+
+        // Two consecutive disagreeing watchdog ticks (WTS reports unlocked): correction applies
+        // on exactly the second, per ReconciliationStep's hysteresis.
+        var tick1 = PolicyBridge.ReconciliationStep(
+            mirror: true, queriedLocked: false, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 10, consecutiveDisagreementCount: 0);
+        Assert.False(tick1.CorrectionApplied);
+
+        var tick2 = PolicyBridge.ReconciliationStep(
+            mirror: true, queriedLocked: false, querySucceeded: true,
+            ticksSinceLastSessionSwitchMirrorChange: 10, consecutiveDisagreementCount: tick1.DisagreementCount);
+        Assert.True(tick2.CorrectionApplied);
+        Assert.False(tick2.Mirror);
+
+        // Corrections drive behavior, not just the bool (RFC): mirror update then
+        // Advance(Reconcile) — here, the real Core.Policy.step call with the corrected mirror.
+        var correctedInputs = new Core.StepInputs(sessionLocked: tick2.Mirror, paused: false, lockInhibited: false, inputIdleMs: 0L);
+        var ctx = new Core.StepContext(
+            now: Core.MonotonicMs.NewMonotonicMs(1000),
+            nowWall: Core.WallClockMs.NewWallClockMs(1000),
+            inputs: correctedInputs);
+        var result = Core.Policy.step(config, state, ctx, Core.Event.Reconcile);
+        var newStatus = Core.Policy.status(result.State);
+
+        Assert.NotEqual(Core.Status.SessionLocked, newStatus);
+
+        // The Advance-internal suppression-transition rule (which owns the sample-timer restart
+        // decision by construction) must decide to restart sampling on this exact
+        // (previousStatus, newStatus) pair — not merely "Advance was called."
+        var transition = PolicyBridge.SuppressionTransitionStep(previousStatus, newStatus);
+        Assert.True(transition.RestartSampleTimer);
+        Assert.True(transition.ResetFilters);
+        Assert.True(transition.KickAcquisition);
+        Assert.False(transition.StopSampleTimer);
+    }
+}
+
+/// RFC 0002-environment-levels, "Slices" item 4: "a shell test asserts every Status case
+/// renders without throwing" — pinning that no future Status arm needs a new StatusText
+/// guard. Enumerates the DU's cases via reflection rather than a hand-written list of today's
+/// six, specifically so a future seventh `Status` case is picked up automatically and would
+/// fail this test through `StatusText`'s `UnreachableException` default arm — exactly the
+/// crash the RFC calls out ("a seventh case would crash the watchdog on its first inhibited
+/// tick").
+public class StatusTextExhaustivenessTests
+{
+    [Fact]
+    public void Every_Status_case_renders_via_StatusText_without_throwing()
+    {
+        var allStatusValues = typeof(Core.Status)
+            .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(p => p.PropertyType == typeof(Core.Status))
+            .Select(p => (Core.Status)p.GetValue(null)!)
+            .ToList();
+
+        Assert.NotEmpty(allStatusValues);
+        foreach (var status in allStatusValues)
+        {
+            Assert.False(string.IsNullOrEmpty(PolicyBridge.StatusText(status, lastObservationDark: false)));
+            Assert.False(string.IsNullOrEmpty(PolicyBridge.StatusText(status, lastObservationDark: true)));
+        }
+    }
+}
+
 /// Migration cleanup (0001-core-brain.md, "Restart stamps" / R2-34): the superseded
 /// last-restart.txt is deleted the first time SaveRestartStamps runs on an upgraded build.
 /// Same real-filesystem precedent as RestartStampsPersistenceTests — no seam to inject a path.

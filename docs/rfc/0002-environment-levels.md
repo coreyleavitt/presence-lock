@@ -364,6 +364,19 @@ Pinned details:
   fast-user-switch/RDP behavior (`WTSSessionInfoEx` often marks disconnected sessions
   locked) and update 0001-core-brain.md's fast-user-switching known-limitation note
   either way.
+  **Spike results (2026-08-31, Windows 11 26200, live console-session probe):** the
+  documented Win8+ semantics hold — a demonstrably unlocked session (no LogonUI
+  process) reports `SessionFlags = 1` (`WTS_SESSIONSTATE_UNLOCK`) and a demonstrably
+  locked one (LogonUI present) reports `SessionFlags = 0` (`WTS_SESSIONSTATE_LOCK`);
+  no Windows-7-style inversion. One marshaling trap observed live, now pinned: the
+  `WTSINFOEX` union holds `LARGE_INTEGER`s, so `Data` is 8-byte aligned — `Level` at
+  offset 0, four padding bytes, `SessionId`@8, `SessionState`@12, `SessionFlags`@16.
+  A naive offset-4 read returns `SessionState` where `SessionFlags` is expected and
+  reads as a plausible wrong answer (the probe's own first version made exactly this
+  error; `WTSActive = 0` masquerades as `WTS_SESSIONSTATE_LOCK`). The
+  fast-user-switch/RDP observation requires a second interactive session and is
+  deferred to slice 6's live smoke (recorded in the handoff as an open item, not
+  silently dropped).
 
 ### Pause ownership
 

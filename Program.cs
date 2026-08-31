@@ -114,6 +114,29 @@ static class Log
             // Logging must never take the watcher down.
         }
     }
+
+    static readonly Dictionary<string, long> rateLimitedLastWriteAt = new();
+    static readonly object RateLimitGate = new();
+
+    // Minimal once-per-interval guard (RFC 0002-environment-levels names this precedent for
+    // both the WTS-query failure line here and the slice-5 inhibitor-query failure line; no
+    // rate-limited logging existed anywhere in the tree before this slice, so this is the
+    // first implementation, not a reuse). Keyed rather than message-keyed: a WTS query failure
+    // carries a varying Win32 error code/exception message, and keying on the raw message text
+    // would let text variation defeat the rate limit entirely -- the caller supplies a stable
+    // category key instead. `Environment.TickCount64` (monotonic, boot-relative) rather than
+    // wall-clock, so the guard is immune to a system clock change mid-run.
+    public static void WriteRateLimited(string key, string message, long intervalMs = 60_000)
+    {
+        long now = Environment.TickCount64;
+        lock (RateLimitGate)
+        {
+            if (rateLimitedLastWriteAt.TryGetValue(key, out long last) && now - last < intervalMs)
+                return;
+            rateLimitedLastWriteAt[key] = now;
+        }
+        Write(message);
+    }
 }
 
 sealed class WatcherContext : ApplicationContext
@@ -127,11 +150,25 @@ sealed class WatcherContext : ApplicationContext
     // Environment-level mirrors (RFC 0002-environment-levels, "Session mirror with
     // reconciliation" / "Pause ownership"): the shell owns these as plain bools, sampled fresh
     // into a `Core.StepInputs` on every `Advance` call via `BuildStepInputs` -- never folded
-    // into `Core.State` itself. `sessionLocked` starts false; the startup WTS query that would
-    // populate it correctly on a restart-while-locked process is slice 4, out of scope here.
+    // into `Core.State` itself. `sessionLocked` is seeded from the constructor's synchronous
+    // startup WTS query (slice 4, `AssembleStartupInputs`) -- fail-open, so a failed startup
+    // query leaves it at its safe default, false. Updated thereafter by `OnSessionSwitch` and
+    // by watchdog-tick WTS reconciliation corrections (`PolicyBridge.ReconciliationStep`).
     // `paused` starts from `ConsumePersistedPausedFlag` in the constructor.
     bool sessionLocked;
     bool paused;
+    // WTS reconciliation bookkeeping (RFC 0002-environment-levels, "Session mirror with
+    // reconciliation"), read/written ONLY by the watchdog tick and `OnSessionSwitch` -- both
+    // already UI-thread-only call sites (the threading invariant `Advance` asserts). Ticks
+    // since the last SessionSwitch-driven update that actually CHANGED `sessionLocked` (round-3
+    // boundary rule 2's skip window; see `PolicyBridge.SessionSwitchTicksAfterDelivery`).
+    // Starts at 1 (not 0): at process start no SessionSwitch has fired at all, so the very
+    // first watchdog tick must not be treated as "adjacent to a session switch."
+    int ticksSinceLastSessionSwitchMirrorChange = 1;
+    // Consecutive watchdog ticks the WTS query has disagreed with `sessionLocked`
+    // (`PolicyBridge.ReconciliationStep`'s two-tick hysteresis counter; round-3 boundary rule 1
+    // holds this across a failed query rather than resetting it).
+    int sessionLockDisagreementCount;
     // Presence-stabilization filter (0001-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
     // raw per-frame FaceDetector output flickers false-positive on an empty scene under a
     // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/Advance, so every
@@ -229,17 +266,142 @@ sealed class WatcherContext : ApplicationContext
         return unchecked((uint)Environment.TickCount - lii.dwTime);
     }
 
+    // WTS session-lock query (RFC 0002-environment-levels, "Session mirror with
+    // reconciliation"): WTSQuerySessionInformation(WTSSessionInfoEx) against the local server
+    // (IntPtr.Zero, the documented WTS_CURRENT_SERVER_HANDLE) for the calling process's own
+    // session (WTS_CURRENT_SESSION), used both by the constructor's synchronous startup query
+    // and by every watchdog-tick reconciliation.
+    // CharSet.Unicode explicitly: wtsapi32.dll exports only the "A"/"W"-suffixed symbols, no
+    // bare "WTSQuerySessionInformation" -- without an explicit CharSet the default P/Invoke
+    // probe (CharSet.Ansi) would silently bind the "A" variant instead.
+    [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool WTSQuerySessionInformation(
+        IntPtr hServer, int sessionId, WTS_INFO_CLASS wtsInfoClass, out IntPtr ppBuffer, out int pBytesReturned);
+
+    [DllImport("wtsapi32.dll")]
+    static extern void WTSFreeMemory(IntPtr pMemory);
+
+    enum WTS_INFO_CLASS
+    {
+        WTSSessionInfoEx = 25,
+    }
+
+    const int WTS_CURRENT_SESSION = -1;
+
+    // WTSINFOEX layout (RFC 0002-environment-levels, "Session mirror with reconciliation",
+    // spike deliverable -- marshaling trap verified LIVE on this machine): `Data` is a union
+    // whose largest arm (WTSINFOEX_LEVEL1) holds LARGE_INTEGER fields further out, which forces
+    // 8-byte alignment on the whole union -- so `Data` begins at byte offset 8, not 4, with 4
+    // padding bytes after the leading `Level` DWORD. Within `Data`: SessionId sits at absolute
+    // offset 8, SessionState at offset 12, SessionFlags at offset 16. An offset-4 read (the
+    // naive "right after Level" guess) plausibly returns SessionState where SessionFlags is
+    // expected -- this struct only maps the three fields this query needs, at their verified
+    // absolute offsets, specifically to make that trap impossible to reintroduce silently.
+    [StructLayout(LayoutKind.Explicit)]
+    struct WTSINFOEX_LEVEL1_PARTIAL
+    {
+        [FieldOffset(0)] public int Level;
+        [FieldOffset(8)] public int SessionId;
+        [FieldOffset(12)] public int SessionState;
+        [FieldOffset(16)] public int SessionFlags;
+    }
+
+    // The untestable OS-boundary half of the WTS query -- P/Invoke call, buffer lifetime, and
+    // offset read -- kept as thin as InputIdleMs's precedent immediately above. The one
+    // genuinely meaningful piece of logic (what a SessionFlags value MEANS) is
+    // PolicyBridge.InterpretSessionFlags, pure and unit-tested; this method only gets bytes off
+    // the wire and hands them off. Rate-limited on failure: called every watchdog tick (5s
+    // default), so an unthrottled log line would spam during a genuine outage.
+    static PolicyBridge.WtsLockQueryResult QuerySessionLocked()
+    {
+        IntPtr buffer = IntPtr.Zero;
+        try
+        {
+            if (!WTSQuerySessionInformation(
+                    IntPtr.Zero, WTS_CURRENT_SESSION, WTS_INFO_CLASS.WTSSessionInfoEx, out buffer, out int bytesReturned))
+            {
+                Log.WriteRateLimited("wts-query",
+                    $"WTSQuerySessionInformation failed (Win32 error {Marshal.GetLastWin32Error()}) -- " +
+                    "fail-open: sessionLocked mirror unchanged, reconciliation skipped this tick");
+                return new PolicyBridge.WtsLockQueryResult(Succeeded: false, Locked: false);
+            }
+            // Sanity floor: SessionFlags sits at offset 16 and is itself 4 bytes, so a
+            // legitimate buffer must be at least 20 bytes -- guards the Marshal.PtrToStructure
+            // read below against a malformed/truncated response.
+            if (bytesReturned < 20)
+            {
+                Log.WriteRateLimited("wts-query",
+                    $"WTSQuerySessionInformation returned only {bytesReturned} bytes (need >= 20 for " +
+                    "SessionFlags) -- fail-open: sessionLocked mirror unchanged, reconciliation skipped this tick");
+                return new PolicyBridge.WtsLockQueryResult(Succeeded: false, Locked: false);
+            }
+
+            var info = Marshal.PtrToStructure<WTSINFOEX_LEVEL1_PARTIAL>(buffer);
+            var result = PolicyBridge.InterpretSessionFlags(info.SessionFlags);
+            if (!result.Succeeded)
+                Log.WriteRateLimited("wts-query",
+                    $"WTSQuerySessionInformation returned unrecognized SessionFlags {info.SessionFlags} -- " +
+                    "fail-open: sessionLocked mirror unchanged, reconciliation skipped this tick");
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log.WriteRateLimited("wts-query",
+                $"WTS session query threw ({ex.Message}) -- fail-open: sessionLocked mirror unchanged, " +
+                "reconciliation skipped this tick");
+            return new PolicyBridge.WtsLockQueryResult(Succeeded: false, Locked: false);
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero) WTSFreeMemory(buffer);
+        }
+    }
+
     // The ONE StepInputs-construction site (RFC 0002-environment-levels, "Construction
     // discipline"): used by Advance's input assembly and the startup Policy.start call, always
     // via named arguments -- the mitigation for StepInputs' three adjacent same-typed bools,
     // where a positional call could silently transpose two of them. LockInhibited is
-    // hard-coded false until slice 5 wires the inhibitor registry aggregate in.
-    Core.StepInputs BuildStepInputs() =>
+    // hard-coded false until slice 5 wires the inhibitor registry aggregate in. This static
+    // overload is the actual `new Core.StepInputs(...)` call site; the instance overload below
+    // and AssembleStartupInputs's caller both route through it, so "exactly one construction
+    // site" holds even though the startup path can't read the instance's live mirror fields
+    // (they don't exist yet when AssembleStartupInputs runs).
+    static Core.StepInputs BuildStepInputs(bool sessionLocked, bool paused, bool lockInhibited, long inputIdleMs) =>
         new(
             sessionLocked: sessionLocked,
             paused: paused,
-            lockInhibited: false, // slice 5: LockInhibitorRegistry.Active
-            inputIdleMs: InputIdleMs());
+            lockInhibited: lockInhibited,
+            inputIdleMs: inputIdleMs);
+
+    Core.StepInputs BuildStepInputs() =>
+        BuildStepInputs(sessionLocked, paused, lockInhibited: false, inputIdleMs: InputIdleMs());
+
+    // Startup input-assembly ordering (RFC 0002-environment-levels, "Construction discipline"
+    // pinned test / "Session mirror with reconciliation" startup bullet): pause consume-and-
+    // clear, THEN the WTS query, THEN BuildStepInputs -- in exactly that order, because a
+    // misordered constructor would fail SILENTLY as "unsuppressed": sampling and decisions
+    // proceeding as if the session weren't actually locked, on a restart-while-locked process,
+    // for up to one watchdog interval. The constructor itself can't be driven under xunit
+    // (WinForms/WinRT construction), so this is the testable seam the RFC calls for: a pure
+    // orchestrator over injected delegates whose call order a test can record and assert
+    // directly, with the constructor supplying the real
+    // ConsumePersistedPausedFlag/QuerySessionLocked/InputIdleMs implementations. Returns the
+    // values the constructor needs rather than mutating instance fields, so the ordering logic
+    // itself has no WinForms-instance dependency at all. Fail-open at startup too (RFC): a
+    // failed WTS query yields sessionLocked = false, matching QuerySessionLocked's
+    // Succeeded = false contract -- a startup query never sets locked = true from bad data.
+    internal static (bool Paused, bool SessionLocked, Core.StepInputs Inputs) AssembleStartupInputs(
+        Func<bool> consumePersistedPausedFlag,
+        Func<PolicyBridge.WtsLockQueryResult> queryWtsSessionLocked,
+        Func<long> readInputIdleMs)
+    {
+        bool paused = consumePersistedPausedFlag();
+        var wts = queryWtsSessionLocked();
+        bool sessionLocked = wts.Succeeded && wts.Locked;
+        var inputs = BuildStepInputs(
+            sessionLocked: sessionLocked, paused: paused, lockInhibited: false, inputIdleMs: readInputIdleMs());
+        return (paused, sessionLocked, inputs);
+    }
 
     public WatcherContext()
     {
@@ -300,6 +462,39 @@ sealed class WatcherContext : ApplicationContext
         watchdogTimer = new WinFormsTimer { Interval = Core.Cadence.WatchdogIntervalMs };
         watchdogTimer.Tick += (_, _) =>
         {
+            // WTS reconciliation runs FIRST (RFC 0002-environment-levels, "Advance and timers":
+            // watchdog tick composition order, slice-4 form -- reconcile, then
+            // SamplingWatchdogStep; the inhibitor-refresh middle step is slice 5, no registry
+            // exists yet) so SamplingWatchdogStep below always reads this tick's corrected
+            // Policy.status, never a stale one.
+            var wtsResult = QuerySessionLocked();
+            var reconciliation = PolicyBridge.ReconciliationStep(
+                mirror: sessionLocked,
+                queriedLocked: wtsResult.Locked,
+                querySucceeded: wtsResult.Succeeded,
+                ticksSinceLastSessionSwitchMirrorChange: ticksSinceLastSessionSwitchMirrorChange,
+                consecutiveDisagreementCount: sessionLockDisagreementCount);
+            sessionLockDisagreementCount = reconciliation.DisagreementCount;
+            if (reconciliation.CorrectionApplied)
+            {
+                // Corrections drive behavior, not just the bool (RFC): mirror update then
+                // Advance(Reconcile), the identical path a live SessionSwitch takes -- timer
+                // stop/start, filter/freshness resets, and KickAcquisitionIfNeeded all ride the
+                // Advance-internal suppression-transition rule by construction, never a
+                // hand-copied chore here. Each correction logs a warning: it is itself a signal
+                // worth seeing (a missed SessionSwitch edge just self-healed).
+                Log.Write($"WARNING: WTS reconciliation correcting sessionLocked mirror " +
+                          $"{sessionLocked} -> {reconciliation.Mirror} (OS query disagreed for two " +
+                          "consecutive watchdog ticks)");
+                sessionLocked = reconciliation.Mirror;
+                Advance(Core.Event.Reconcile);
+            }
+            // One more watchdog interval has now elapsed since the last mirror-changing
+            // SessionSwitch delivery (or since startup, per the field's initial value of 1) --
+            // advanced here, once per tick, after this tick's own reconciliation already read
+            // the pre-increment value.
+            ticksSinceLastSessionSwitchMirrorChange++;
+
             // Live from cfg (not captured once) so a Settings change to SampleIntervalMs is
             // picked up on the very next tick.
             long starvationMs = Math.Max(10L * cfg.SampleIntervalMs, 15000);
@@ -350,21 +545,29 @@ sealed class WatcherContext : ApplicationContext
 
         Log.Write($"started (threshold {cfg.AwayThresholdSeconds}s, sample {cfg.SampleIntervalMs}ms)");
 
-        // Paused-flag consume-and-clear (0001-core-brain.md R2-11 / RFC 0002-environment-levels
-        // "Pause ownership", pinned lifecycle): read → set the paused mirror → build the
-        // initial StepInputs via the ONE helper → single Policy.start call, before the first
-        // camera-acquisition attempt. Written only by RestartProcess, immediately before spawn
-        // — so pause survives every self-restart, but a tray Exit or a normal launch never
-        // inherits a stale pause. Inheritance is now ordinary input passing into Policy.start
-        // (the refeed half of the old protocol -- an Event.Paused injection after start -- is
-        // deleted): a restart-while-paused process renders Paused from its very first frame,
-        // computed by Policy.start directly from these initial inputs. The sessionLocked mirror
-        // starts false — the startup WTS query that would populate it correctly is slice 4.
-        paused = PolicyBridge.ConsumePersistedPausedFlag();
+        // Paused-flag consume-and-clear, THEN the synchronous startup WTS query, THEN the
+        // initial StepInputs via the ONE helper, THEN the single Policy.start call -- pinned
+        // order (0001-core-brain.md R2-11 / RFC 0002-environment-levels "Pause ownership" +
+        // "Session mirror with reconciliation" startup bullet), assembled by
+        // AssembleStartupInputs so the ordering itself is unit-tested. This all runs before the
+        // first camera-acquisition attempt. The paused flag is written only by RestartProcess,
+        // immediately before spawn — so pause survives every self-restart, but a tray Exit or a
+        // normal launch never inherits a stale pause; inheritance is ordinary input passing
+        // into Policy.start now (the refeed half of the old protocol -- an Event.Paused
+        // injection after start -- is deleted). The startup WTS query is fail-open exactly like
+        // every later reconciliation tick: a failed/uninterpretable query leaves sessionLocked
+        // at false rather than guessing locked. Without querying WTS here, a restart-while-
+        // locked process (CaptureFailed/BetterCameraAvailable restarts are not gated by session
+        // state) would run unsuppressed with a wrong tray status for up to one watchdog
+        // interval.
+        var startup = AssembleStartupInputs(
+            PolicyBridge.ConsumePersistedPausedFlag, QuerySessionLocked, InputIdleMs);
+        paused = startup.Paused;
+        sessionLocked = startup.SessionLocked;
         state = Core.Policy.start(
             Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
             PolicyBridge.LoadRestartStamps(),
-            BuildStepInputs());
+            startup.Inputs);
         presenceFilterState = Core.PresenceFilter.initial;
         frameFreshnessState = Core.FrameFreshness.initial;
 
@@ -640,12 +843,22 @@ sealed class WatcherContext : ApplicationContext
         {
             if (e.Reason == SessionSwitchReason.SessionLock)
             {
+                bool changed = !sessionLocked;
                 sessionLocked = true;
+                // Round-3 boundary rule 2: the skip window restarts ONLY when this delivery
+                // actually changed the mirror -- an idempotent duplicate SessionSwitch
+                // re-delivery (Windows demonstrably double-fires it) must leave the counter
+                // running, not restart it.
+                ticksSinceLastSessionSwitchMirrorChange =
+                    PolicyBridge.SessionSwitchTicksAfterDelivery(changed, ticksSinceLastSessionSwitchMirrorChange);
                 Advance(Core.Event.Reconcile);
             }
             else if (e.Reason == SessionSwitchReason.SessionUnlock)
             {
+                bool changed = sessionLocked;
                 sessionLocked = false;
+                ticksSinceLastSessionSwitchMirrorChange =
+                    PolicyBridge.SessionSwitchTicksAfterDelivery(changed, ticksSinceLastSessionSwitchMirrorChange);
                 Advance(Core.Event.Reconcile);
             }
         }, null);
@@ -747,26 +960,26 @@ sealed class WatcherContext : ApplicationContext
         // Generalizes the 2026-07-28 burn-in fix (presence-filter/freshness resets) and the
         // 2026-08-12 incident's unconditional sample-timer restart (the 1.0.8.4 fix semantics)
         // to every suppressed -> unsuppressed transition Advance observes, including the
-        // WTS-reconciliation corrections slice 4 adds.
-        bool wasSuppressed = PolicyBridge.IsSuppressedStatus(previousStatus);
-        bool isSuppressed = PolicyBridge.IsSuppressedStatus(newStatus);
-        if (wasSuppressed && !isSuppressed)
-        {
+        // WTS-reconciliation corrections slice 4 adds. The decision itself is
+        // PolicyBridge.SuppressionTransitionStep -- pure and independently unit-tested (the
+        // harness models `step` semantics, not WinForms timers, so this is the only place the
+        // sample-timer restart decision on a WTS-correction-driven unlock can be pinned) --
+        // this method only executes the verdict against the real timer/filter state.
+        var transition = PolicyBridge.SuppressionTransitionStep(previousStatus, newStatus);
+        if (transition.TransitionLogMessage is not null)
             // Transition log lives here, not at the mirror-changing call sites, for the same
             // reason the rule itself does: one owner covers unlock, resume, and slice 4's
             // WTS-reconciliation corrections alike (the log is this project's incident-forensics
             // surface — a suppression exit must never be silent).
-            Log.Write($"suppression exited: {previousStatus} -> {newStatus}");
+            Log.Write(transition.TransitionLogMessage);
+        if (transition.ResetFilters)
+        {
             presenceFilterState = Core.PresenceFilter.initial;
             frameFreshnessState = Core.FrameFreshness.initial;
-            sampleTimer.Start(); // unconditional -- idempotent if already running
-            KickAcquisitionIfNeeded();
         }
-        else if (!wasSuppressed && isSuppressed)
-        {
-            Log.Write($"suppression entered: {previousStatus} -> {newStatus}");
-            sampleTimer.Stop();
-        }
+        if (transition.RestartSampleTimer) sampleTimer.Start(); // unconditional -- idempotent if already running
+        if (transition.StopSampleTimer) sampleTimer.Stop();
+        if (transition.KickAcquisition) KickAcquisitionIfNeeded();
 
         // Status/log-line mapping table (slice 8b deliverable): the once-per-episode
         // dark-vs-no-frame diagnostic fires exactly on the transition into Status.NoSignal,

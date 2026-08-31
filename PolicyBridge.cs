@@ -165,6 +165,130 @@ static class PolicyBridge
     internal static bool IsSuppressedStatus(Core.Status status) =>
         status.Tag == Core.Status.Tags.Paused || status.Tag == Core.Status.Tags.SessionLocked;
 
+    /// Consequences of one before/after `Status` pair across an `Advance` call (RFC
+    /// 0002-environment-levels, "Advance and timers", round 3): extracted as a pure function
+    /// so the rule generalizing the 2026-07-28 burn-in fix (filter/freshness resets) and the
+    /// 2026-08-12 incident's unconditional sample-timer restart is itself independently
+    /// testable -- including via the slice-4 WTS-reconciliation correction path, which the
+    /// harness cannot see (it models `step` semantics, not WinForms timers) -- without driving
+    /// a real `WatcherContext`/WinForms `Timer`. `TransitionLogMessage` is `null` on a
+    /// non-transition tick (every other field `false`); `Advance` writes it verbatim when
+    /// non-null, matching the two hand-written log lines this replaces exactly.
+    internal readonly record struct SuppressionTransitionVerdict(
+        bool ResetFilters, bool RestartSampleTimer, bool KickAcquisition, bool StopSampleTimer,
+        string? TransitionLogMessage);
+
+    internal static SuppressionTransitionVerdict SuppressionTransitionStep(Core.Status previousStatus, Core.Status newStatus)
+    {
+        bool wasSuppressed = IsSuppressedStatus(previousStatus);
+        bool isSuppressed = IsSuppressedStatus(newStatus);
+
+        if (wasSuppressed && !isSuppressed)
+            return new SuppressionTransitionVerdict(
+                ResetFilters: true, RestartSampleTimer: true, KickAcquisition: true, StopSampleTimer: false,
+                TransitionLogMessage: $"suppression exited: {previousStatus} -> {newStatus}");
+
+        if (!wasSuppressed && isSuppressed)
+            return new SuppressionTransitionVerdict(
+                ResetFilters: false, RestartSampleTimer: false, KickAcquisition: false, StopSampleTimer: true,
+                TransitionLogMessage: $"suppression entered: {previousStatus} -> {newStatus}");
+
+        return new SuppressionTransitionVerdict(
+            ResetFilters: false, RestartSampleTimer: false, KickAcquisition: false, StopSampleTimer: false,
+            TransitionLogMessage: null);
+    }
+
+    /// Result of one WTS session-lock query (RFC 0002-environment-levels, "Session mirror with
+    /// reconciliation"): `Succeeded = false` means fail-open for reconciliation purposes,
+    /// covering both an outright `WTSQuerySessionInformation` API failure and a
+    /// Succeeded-but-uninterpretable `SessionFlags` alike (see `InterpretSessionFlags`) --
+    /// both must never set `Locked = true` by side effect, so `Locked` is meaningless whenever
+    /// `Succeeded` is false and callers must not read it in that case.
+    internal readonly record struct WtsLockQueryResult(bool Succeeded, bool Locked);
+
+    /// Interprets `WTSINFOEX`'s `SessionFlags` (RFC 0002-environment-levels, "Session mirror
+    /// with reconciliation", spike deliverable): documented Windows 8+ semantics, confirmed
+    /// live on this machine (Windows 11 26200) against a demonstrably unlocked console session
+    /// -- `WTS_SESSIONSTATE_LOCK = 0`, `WTS_SESSIONSTATE_UNLOCK = 1`,
+    /// `WTS_SESSIONSTATE_UNKNOWN = -1` (0xFFFFFFFF as a signed 32-bit value). Fail-open:
+    /// `UNKNOWN` and any other unrecognized value report `Succeeded = false` rather than
+    /// guessing a lock state -- "the query did not succeed, for reconciliation purposes" per
+    /// the RFC, treating an uninterpretable-but-present value identically to the P/Invoke call
+    /// itself failing. Pure and separated from the P/Invoke call itself (`Program.cs`'s
+    /// `QuerySessionLocked`) so the one genuinely meaningful piece of logic in the query path
+    /// -- what each `SessionFlags` value means -- is unit-tested without a live WTS handle.
+    internal static WtsLockQueryResult InterpretSessionFlags(int sessionFlags) => sessionFlags switch
+    {
+        0 => new WtsLockQueryResult(Succeeded: true, Locked: true),
+        1 => new WtsLockQueryResult(Succeeded: true, Locked: false),
+        _ => new WtsLockQueryResult(Succeeded: false, Locked: false),
+    };
+
+    /// Verdict of one `ReconciliationStep` evaluation: `Mirror`/`DisagreementCount` are the
+    /// caller's next `sessionLocked`/disagreement-counter fields (a plain replace, matching
+    /// `WatchdogVerdict`'s precedent); `CorrectionApplied` is true only on the tick the mirror
+    /// actually changes as a result of this call.
+    internal readonly record struct ReconciliationVerdict(bool Mirror, int DisagreementCount, bool CorrectionApplied);
+
+    /// The pure WTS-reconciliation decision (RFC 0002-environment-levels, "Session mirror with
+    /// reconciliation"), extracted per the RFC's explicit instruction, mirroring the
+    /// `SamplingWatchdogStep` precedent: a several-branch state machine on the mechanism
+    /// closest to the incident this RFC exists to fix gets the same independent, dedicated unit
+    /// coverage as everything else here, rather than resting on one manual live-smoke
+    /// observation.
+    ///
+    /// Composition, in order:
+    /// 1. Skip window (round-3 boundary rule 2): within one watchdog interval of a
+    ///    SessionSwitch-driven mirror-value-CHANGING update
+    ///    (`ticksSinceLastSessionSwitchMirrorChange &lt; 1`), reconciliation is skipped
+    ///    entirely -- mirror and counter both untouched, no correction -- regardless of query
+    ///    success or agreement. (Whether an idempotent duplicate `SessionSwitch` delivery
+    ///    restarts that counter is decided before this function ever runs -- see
+    ///    `SessionSwitchTicksAfterDelivery`.)
+    /// 2. Fail-open (round-3 boundary rule 1): a failed query (`querySucceeded = false`) HOLDS
+    ///    the disagreement counter -- neither counts toward it nor resets it -- and never
+    ///    corrects the mirror. A reset-on-failure reading would let an intermittent-failure
+    ///    pattern (disagree, fail, disagree, fail, ...) starve the heal forever.
+    /// 3. Agreement resets the streak to zero (only CONSECUTIVE disagreement counts).
+    /// 4. Disagreement increments the streak; a correction is applied -- mirror flips to the
+    ///    queried value, counter resets to zero -- only once the streak reaches two
+    ///    (hysteresis): the first disagreeing tick is recorded but not yet acted on.
+    internal static ReconciliationVerdict ReconciliationStep(
+        bool mirror,
+        bool queriedLocked,
+        bool querySucceeded,
+        int ticksSinceLastSessionSwitchMirrorChange,
+        int consecutiveDisagreementCount)
+    {
+        if (ticksSinceLastSessionSwitchMirrorChange < 1)
+            return new ReconciliationVerdict(Mirror: mirror, DisagreementCount: consecutiveDisagreementCount, CorrectionApplied: false);
+
+        if (!querySucceeded)
+            return new ReconciliationVerdict(Mirror: mirror, DisagreementCount: consecutiveDisagreementCount, CorrectionApplied: false);
+
+        if (queriedLocked == mirror)
+            return new ReconciliationVerdict(Mirror: mirror, DisagreementCount: 0, CorrectionApplied: false);
+
+        int nextCount = consecutiveDisagreementCount + 1;
+        if (nextCount < 2)
+            return new ReconciliationVerdict(Mirror: mirror, DisagreementCount: nextCount, CorrectionApplied: false);
+
+        return new ReconciliationVerdict(Mirror: queriedLocked, DisagreementCount: 0, CorrectionApplied: true);
+    }
+
+    /// Round-3 boundary rule 2's companion (RFC 0002-environment-levels, "Session mirror with
+    /// reconciliation"): the shell's `ticksSinceLastSessionSwitchMirrorChange` counter,
+    /// advanced across one `SessionSwitch` delivery. Resets to zero only when the delivery
+    /// actually CHANGES the mirror value -- Windows demonstrably double-fires `SessionSwitch`
+    /// (0001-core-brain.md), and restarting the skip window on an idempotent duplicate could
+    /// push a stuck mirror's heal out indefinitely under unrelated session traffic. Kept as its
+    /// own tiny pure function, separate from `ReconciliationStep` (which only ever sees the
+    /// resulting tick count as a plain `int`), so this specific correctness rule has its own
+    /// dedicated unit test rather than being trusted to a single `if` inline in
+    /// `OnSessionSwitch`.
+    internal static int SessionSwitchTicksAfterDelivery(bool mirrorValueChanged, int currentTicks) =>
+        mirrorValueChanged ? 0 : currentTicks;
+
     /// The sampling watchdog's status gate (incident 2026-08-12: a resume path that only
     /// restarted `sampleTimer` when `reader is not null` left it permanently stopped after a
     /// camera died inside the restart cooldown while paused). True exactly for the statuses
