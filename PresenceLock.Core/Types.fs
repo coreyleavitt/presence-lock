@@ -57,14 +57,14 @@ type Observation =
 
 [<RequireQualifiedAccess>]
 type Event =
-    | Sample of Observation * inputIdleMs: int64
-    /// RFC 0002 (environment-levels), levels path only (`Policy.stepLevels`): "nothing
-    /// happened, except the levels may have changed." Payload-free — the shell fires it
-    /// synchronously whenever any `StepInputs` mirror changes (pause toggle, session
-    /// switch, WTS reconciliation correction, inhibitor-aggregate transition), so edge
-    /// derivation and status recomputation run promptly even while the sample timer is
-    /// stopped (suppressed). Never emits `Action.Lock`: a lock decision needs a current
-    /// observation, and `Reconcile` carries none.
+    | Sample of Observation
+    /// RFC 0002 (environment-levels): "nothing happened, except the levels may have
+    /// changed." Payload-free — the shell fires it synchronously whenever any `StepInputs`
+    /// mirror changes (pause toggle, session switch, WTS reconciliation correction,
+    /// inhibitor-aggregate transition), so edge derivation and status recomputation run
+    /// promptly even while the sample timer is stopped (suppressed). Never emits
+    /// `Action.Lock`: a lock decision needs a current observation, and `Reconcile` carries
+    /// none.
     | Reconcile
     | InitSucceeded
     /// Startup/retry failure, before any `InitSucceeded` this process. Streak-gated by
@@ -74,15 +74,6 @@ type Event =
     /// payload: post-success, the restart decision no longer depends on the failure's
     /// classification — see "Notes: recovery boundary."
     | CaptureFailed
-    /// Old (event-folded) session/pause contract — `Policy.start`/`Policy.step` only.
-    /// Superseded by `StepInputs.SessionLocked`/`.Paused` + `Reconcile` in the levels path
-    /// (RFC 0002-environment-levels); `Policy.stepLevels` treats these four as decision-state
-    /// no-ops (transitional arms, deleted outright once the shell migration in a later
-    /// slice removes the events themselves from this DU).
-    | SessionLocked
-    | SessionUnlocked
-    | Paused
-    | Resumed
     /// A preferred camera became available post-acquisition (RFC addendum 2026-08-01, slice
     /// 10: camera-arrival upgrade) — fed by the shell after device-arrival settle + a
     /// preference check finds the would-pick-now camera differs from the in-use one. Carries
@@ -133,12 +124,12 @@ type RestartStamps =
       ReevalAt: Nullable<int64>
       UpgradeAt: Nullable<int64> }
 
-/// Sampled environment truth for the levels path (RFC 0002-environment-levels), passed on
-/// EVERY `Policy.stepLevels`/`Policy.startLevels` call — never folded from events, so it can
-/// never silently desync from what the shell actually observes (the incident this RFC's
-/// Motivation traces to a folded `IsSessionLocked`/`IsPaused` belief that one swallowed edge
-/// diverges permanently). Deliberately a plain reference record, NOT `[<Struct>]`: as a
-/// struct, `default(StepInputs)` reads as the *dangerous* value (unsuppressed, uninhibited,
+/// Sampled environment truth (RFC 0002-environment-levels), passed on EVERY `Policy.step`/
+/// `Policy.start` call — never folded from events, so it can never silently desync from
+/// what the shell actually observes (the incident this RFC's Motivation traces to a folded
+/// `IsSessionLocked`/`IsPaused` belief that one swallowed edge diverges permanently).
+/// Deliberately a plain reference record, NOT `[<Struct>]`: as a struct,
+/// `default(StepInputs)` reads as the *dangerous* value (unsuppressed, uninhibited,
 /// idle) and is reachable through zero-init paths no call-site discipline can guard
 /// (`Array.zeroCreate`, a dictionary miss, `Unchecked.defaultof`, an uninitialized field); as
 /// a reference type, every such path yields `null` and fails loud with an NRE on first field
@@ -152,7 +143,7 @@ type StepInputs =
 /// Everything about "the world right now" that isn't config, state, or the event being
 /// processed, bundled into one record rather than adjacent positional parameters — the same
 /// call-site transposition-hazard reasoning behind `MonotonicMs`/`WallClockMs`, one level up.
-/// `Event` stays a separate trailing parameter to `Policy.stepLevels`: the *reason* the call
+/// `Event` stays a separate trailing parameter to `Policy.step`: the *reason* the call
 /// happened, categorically different from ambient context.
 [<Struct>]
 type StepContext =
@@ -180,23 +171,14 @@ type State =
           /// `InitSucceeded`, which cannot recur this process). Drives `Status.Recovering`
           /// and, from slice 6, the `RecoveryFailureThreshold` gate.
           InitFailStreak: int
-          /// Whether a `FaceSeen` has occurred since the last baseline event
-          /// (`start`/`InitSucceeded`/`SessionUnlocked` unless paused/`Resumed`).
+          /// Whether a `FaceSeen` has occurred since the last baseline event (`start`,
+          /// `InitSucceeded`, or the suppressed -> unsuppressed edge).
           Armed: bool
-          /// Old (event-folded) session/pause contract — read/written by `Policy.start`/
-          /// `Policy.step` only. The levels path (`Policy.startLevels`/`Policy.stepLevels`)
-          /// never reads or writes these; suppression there is derived fresh from
-          /// `LastInputs` on every call. Superseded by RFC 0002-environment-levels; deleted
-          /// outright once the shell migration cuts over.
-          IsPaused: bool
-          IsSessionLocked: bool
-          /// Levels path only (RFC 0002-environment-levels): the previous
-          /// `stepLevels`/`startLevels` call's sampled environment truth, for suppression-
-          /// edge derivation and levels-based status computation. Lives inside opaque
-          /// `State` — not a shell-held (previous, current) pair — so it has exactly one
-          /// writer (`stepLevels`'s tail) and can never desync from what `stepLevels` last
-          /// saw. The old path never reads this field; `start` initializes it to a harmless
-          /// all-false/0 instance.
+          /// The previous `step`/`start` call's sampled environment truth, for suppression-
+          /// edge derivation and status computation (RFC 0002-environment-levels). Lives
+          /// inside opaque `State` — not a shell-held (previous, current) pair — so it has
+          /// exactly one writer (`step`'s tail) and can never desync from what `step` last
+          /// saw. `start` initializes it to the initial `StepInputs` verbatim.
           LastInputs: StepInputs
           /// Timestamp grace is measured live against — reset only by baseline events, never
           /// by an ordinary `Sample`.

@@ -47,6 +47,66 @@ public class IsHandleInvalidTests
     }
 }
 
+/// RFC 0002-environment-levels, "Construction discipline": `StepInputs` has three adjacent
+/// same-typed bools, so a positional C# constructor call with two of them transposed still
+/// compiles silently. The RFC's mitigation is a one-helper, always-named-arguments rule at
+/// every shell call site (`PolicyBridge`/`Program.cs` construct `StepInputs` in exactly one
+/// place) — this test is the pinned safety net for that rule: it constructs `StepInputs` via
+/// named arguments with each bool flipped independently off a known baseline and asserts
+/// EVERY field of the result (not just the one flipped), so a future reordering of the F#
+/// record's declared fields — which would only matter to a positional call — can never
+/// silently transpose which field a given named argument lands on without failing here first.
+public class StepInputsConstructionTests
+{
+    [Fact]
+    public void Flipping_SessionLocked_leaves_every_other_field_at_baseline()
+    {
+        var inputs = new Core.StepInputs(
+            sessionLocked: true, paused: false, lockInhibited: false, inputIdleMs: 0L);
+
+        Assert.True(inputs.SessionLocked);
+        Assert.False(inputs.Paused);
+        Assert.False(inputs.LockInhibited);
+        Assert.Equal(0L, inputs.InputIdleMs);
+    }
+
+    [Fact]
+    public void Flipping_Paused_leaves_every_other_field_at_baseline()
+    {
+        var inputs = new Core.StepInputs(
+            sessionLocked: false, paused: true, lockInhibited: false, inputIdleMs: 0L);
+
+        Assert.False(inputs.SessionLocked);
+        Assert.True(inputs.Paused);
+        Assert.False(inputs.LockInhibited);
+        Assert.Equal(0L, inputs.InputIdleMs);
+    }
+
+    [Fact]
+    public void Flipping_LockInhibited_leaves_every_other_field_at_baseline()
+    {
+        var inputs = new Core.StepInputs(
+            sessionLocked: false, paused: false, lockInhibited: true, inputIdleMs: 0L);
+
+        Assert.False(inputs.SessionLocked);
+        Assert.False(inputs.Paused);
+        Assert.True(inputs.LockInhibited);
+        Assert.Equal(0L, inputs.InputIdleMs);
+    }
+
+    [Fact]
+    public void Setting_InputIdleMs_leaves_every_other_field_at_baseline()
+    {
+        var inputs = new Core.StepInputs(
+            sessionLocked: false, paused: false, lockInhibited: false, inputIdleMs: 4242L);
+
+        Assert.False(inputs.SessionLocked);
+        Assert.False(inputs.Paused);
+        Assert.False(inputs.LockInhibited);
+        Assert.Equal(4242L, inputs.InputIdleMs);
+    }
+}
+
 public class ClassifyObservationTests
 {
     [Fact]
@@ -317,18 +377,6 @@ public class SanitizeSensingConfigTests
     }
 }
 
-public class ClassifySampleTests
-{
-    [Fact]
-    public void Constructs_a_Sample_event_carrying_the_classified_observation_and_idle_time()
-    {
-        var evt = PolicyBridge.ClassifySample(haveFrame: true, dark: false, present: true, inputIdleMs: 1234);
-        var sample = Assert.IsType<Core.Event.Sample>(evt);
-        Assert.Equal(Core.Observation.FaceSeen, sample.Item1);
-        Assert.Equal(1234, sample.inputIdleMs);
-    }
-}
-
 /// Shell-side helper feeding PresenceLock.Core's PresenceFilter (0001-core-brain.handoff.md,
 /// "Burn-in incident 2026-07-28"). Takes plain `BitmapBounds` rather than `DetectedFace` itself
 /// so it stays unit-testable: `DetectedFace` has no public constructor and can only be produced
@@ -446,6 +494,28 @@ public class IsAcquiringOrRecoveringTests
         Assert.False(PolicyBridge.IsAcquiringOrRecovering(Core.Status.NoSignal));
         Assert.False(PolicyBridge.IsAcquiringOrRecovering(Core.Status.SessionLocked));
         Assert.False(PolicyBridge.IsAcquiringOrRecovering(Core.Status.Paused));
+    }
+}
+
+/// Suppression predicate (RFC 0002-environment-levels, "Status"): the two priority rows
+/// sampling stops for, used by Advance's suppression-transition rule to detect the before/
+/// after status pair's edge.
+public class IsSuppressedStatusTests
+{
+    [Fact]
+    public void Paused_and_SessionLocked_are_suppressed()
+    {
+        Assert.True(PolicyBridge.IsSuppressedStatus(Core.Status.Paused));
+        Assert.True(PolicyBridge.IsSuppressedStatus(Core.Status.SessionLocked));
+    }
+
+    [Fact]
+    public void Every_other_status_is_not_suppressed()
+    {
+        Assert.False(PolicyBridge.IsSuppressedStatus(Core.Status.Watching));
+        Assert.False(PolicyBridge.IsSuppressedStatus(Core.Status.NoSignal));
+        Assert.False(PolicyBridge.IsSuppressedStatus(Core.Status.AcquiringCamera));
+        Assert.False(PolicyBridge.IsSuppressedStatus(Core.Status.Recovering));
     }
 }
 

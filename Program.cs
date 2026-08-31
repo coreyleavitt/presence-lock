@@ -121,15 +121,25 @@ sealed class WatcherContext : ApplicationContext
     // `cfg` changes (Settings commit) so `step` always reads live config.
     Core.PolicyConfig policyConfig;
     Core.State state;
+    // Environment-level mirrors (RFC 0002-environment-levels, "Session mirror with
+    // reconciliation" / "Pause ownership"): the shell owns these as plain bools, sampled fresh
+    // into a `Core.StepInputs` on every `Advance` call via `BuildStepInputs` -- never folded
+    // into `Core.State` itself. `sessionLocked` starts false; the startup WTS query that would
+    // populate it correctly on a restart-while-locked process is slice 4, out of scope here.
+    // `paused` starts from `ConsumePersistedPausedFlag` in the constructor.
+    bool sessionLocked;
+    bool paused;
     // Presence-stabilization filter (0001-core-brain.handoff.md, "Burn-in incident 2026-07-28"):
     // raw per-frame FaceDetector output flickers false-positive on an empty scene under a
     // hunting auto-framing crop. Stepped in SampleAsync before ClassifySample/Advance, so every
     // downstream consumer sees the identical stabilized presence signal. Reset to
-    // `Core.PresenceFilter.initial` everywhere Policy resets its own armed/away/signal-health
-    // baseline: `StartWatchingAsync`'s init-success path, the session-unlock path in
-    // OnSessionSwitch (only when the unlock actually re-baselined -- i.e. wasn't a no-op while
-    // paused), and TogglePause's resume branch — since spatial coherence measured against a
-    // previous acquisition's or watching episode's frames must never carry into a new one.
+    // `Core.PresenceFilter.initial` at two kinds of site (RFC 0002-environment-levels, round 3
+    // scoping): fresh-acquisition resets, orthogonal to suppression (`StartWatchingAsync`'s
+    // init path and the constructor, both untouched by this RFC), and the single
+    // Advance-internal suppression-transition rule, which fires this reset on every suppressed
+    // -> unsuppressed transition (session unlock, pause resume, and — from slice 4 — a WTS-
+    // reconciliation correction) — since spatial coherence measured against a previous
+    // acquisition's or watching episode's frames must never carry into a new one.
     Core.FilterState presenceFilterState;
     // Frozen-frame staleness (0001-core-brain.md bug-fix note): tracks whether the frame
     // reader's SystemRelativeTime is still advancing. Stepped in SampleAsync alongside
@@ -216,6 +226,18 @@ sealed class WatcherContext : ApplicationContext
         return unchecked((uint)Environment.TickCount - lii.dwTime);
     }
 
+    // The ONE StepInputs-construction site (RFC 0002-environment-levels, "Construction
+    // discipline"): used by Advance's input assembly and the startup Policy.start call, always
+    // via named arguments -- the mitigation for StepInputs' three adjacent same-typed bools,
+    // where a positional call could silently transpose two of them. LockInhibited is
+    // hard-coded false until slice 5 wires the inhibitor registry aggregate in.
+    Core.StepInputs BuildStepInputs() =>
+        new(
+            sessionLocked: sessionLocked,
+            paused: paused,
+            lockInhibited: false, // slice 5: LockInhibitorRegistry.Active
+            inputIdleMs: InputIdleMs());
+
     public WatcherContext()
     {
         cfg = Config.Load();
@@ -253,8 +275,9 @@ sealed class WatcherContext : ApplicationContext
             retryTimer.Stop();
             // Retry-timer gate (0001-core-brain.md R2-15): the complete, core-owned test —
             // replaces the legacy `!paused && !sessionLocked` shell-local booleans. This is one
-            // of the three call sites sharing the identical status gate (R2-4); the other two
-            // are the direct KickAcquisitionIfNeeded() calls below.
+            // of two call sites sharing the identical status gate (R2-4); the other is
+            // KickAcquisitionIfNeeded, called once from Advance's suppression-transition rule
+            // (RFC 0002-environment-levels) rather than hand-copied at every resume call site.
             if (reader is null && PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state)))
                 await StartWatchingAsync();
         };
@@ -318,22 +341,23 @@ sealed class WatcherContext : ApplicationContext
 
         Log.Write($"started (threshold {cfg.AwayThresholdSeconds}s, sample {cfg.SampleIntervalMs}ms)");
 
-        // Policy.start is called exactly once per process, before the first camera-acquisition
-        // attempt (0001-core-brain.md, Policy.start doc comment).
+        // Paused-flag consume-and-clear (0001-core-brain.md R2-11 / RFC 0002-environment-levels
+        // "Pause ownership", pinned lifecycle): read → set the paused mirror → build the
+        // initial StepInputs via the ONE helper → single Policy.start call, before the first
+        // camera-acquisition attempt. Written only by RestartProcess, immediately before spawn
+        // — so pause survives every self-restart, but a tray Exit or a normal launch never
+        // inherits a stale pause. Inheritance is now ordinary input passing into Policy.start
+        // (the refeed half of the old protocol -- an Event.Paused injection after start -- is
+        // deleted): a restart-while-paused process renders Paused from its very first frame,
+        // computed by Policy.start directly from these initial inputs. The sessionLocked mirror
+        // starts false — the startup WTS query that would populate it correctly is slice 4.
+        paused = PolicyBridge.ConsumePersistedPausedFlag();
         state = Core.Policy.start(
             Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
-            PolicyBridge.LoadRestartStamps());
+            PolicyBridge.LoadRestartStamps(),
+            BuildStepInputs());
         presenceFilterState = Core.PresenceFilter.initial;
         frameFreshnessState = Core.FrameFreshness.initial;
-
-        // Paused-flag consume-and-clear (0001-core-brain.md R2-11, pinned lifecycle): read →
-        // feed Event.Paused through Advance immediately after Policy.start → rewrite cleared.
-        // Written only by RestartProcess, immediately before spawn — so pause survives every
-        // self-restart, but a tray Exit or a normal launch never inherits a stale pause.
-        if (PolicyBridge.ConsumePersistedPausedFlag())
-        {
-            Advance(Core.Event.Paused);
-        }
 
         _ = StartWatchingAsync();
     }
@@ -557,12 +581,20 @@ sealed class WatcherContext : ApplicationContext
             // haveFrame=false, i.e. Observation.NoFrame — the shell keeps sampleTimer running
             // so the NoFrame → re-evaluation backstop engages on the ordinary signal-health path,
             // with no separate mechanism. Every resume path now guarantees sampleTimer is running
-            // whenever this branch can be reached (incident 2026-08-12) — see OnSessionSwitch's
-            // unlock branch and TogglePause's resume branch.
+            // whenever this branch can be reached (incident 2026-08-12) — the Advance-internal
+            // suppression-transition rule (RFC 0002-environment-levels) restarts sampleTimer
+            // unconditionally on every suppressed -> unsuppressed transition, covering both
+            // OnSessionSwitch's unlock and TogglePause's resume by construction.
 
+            // InputIdleMs no longer flows through the Sample payload (RFC 0002-environment-
+            // levels): it lives in StepInputs, read fresh inside Advance's input assembly. This
+            // local read is for LogSensingDiagnostics only -- a second, independent P/Invoke
+            // call accepted explicitly by the RFC (the two values may differ by a few
+            // milliseconds without consequence: this one is prose, Advance's is the decision
+            // input).
             long idleMs = InputIdleMs();
             lastObservationDark = dark;
-            Core.Event sampleEvent = PolicyBridge.ClassifySample(haveFrame, dark, present, idleMs);
+            Core.Event sampleEvent = PolicyBridge.ClassifySample(haveFrame, dark, present);
             LogSensingDiagnostics(haveFrame, dark, present, idleMs, rawFaceCount, frameIsFresh);
             Advance(sampleEvent);
         }
@@ -585,54 +617,27 @@ sealed class WatcherContext : ApplicationContext
     // MediaCapture init must happen on the STA/UI thread — every observed
     // FrameServer wedge followed a re-init from this handler — so marshal
     // the entire body onto the UI thread before touching the camera.
+    // RFC 0002-environment-levels, "Session mirror with reconciliation": updates the
+    // sessionLocked mirror and lets Advance(Reconcile) do the rest. The old pause-precedence
+    // guard (a second Policy.status round-trip of the SessionUnlocked-while-paused shape) is
+    // subsumed outright, not rewired: pause precedence is now the core edge rule (suppressed =
+    // SessionLocked || Paused) plus the Advance-internal suppression-transition rule below --
+    // there is nothing left for this call site to guard. Likewise the presence-filter/
+    // freshness resets and the timer stop/start/KickAcquisitionIfNeeded that used to live here
+    // ride that same Advance-internal rule now, so a WTS-reconciliation correction (slice 4)
+    // gets them by construction instead of by a second hand-copied chore.
     void OnSessionSwitch(object? sender, SessionSwitchEventArgs e) =>
         ui.Post(_ =>
         {
             if (e.Reason == SessionSwitchReason.SessionLock)
             {
-                sampleTimer.Stop();
-                Advance(Core.Event.SessionLocked);
+                sessionLocked = true;
+                Advance(Core.Event.Reconcile);
             }
             else if (e.Reason == SessionSwitchReason.SessionUnlock)
             {
-                // Fed to Core unconditionally, even while paused: the pause-precedence rule
-                // (SessionUnlocked while paused is a no-op) is core-owned, not shell-owned —
-                // see 0001-core-brain.md's pause/unlock truth table.
-                Advance(Core.Event.SessionUnlocked);
-                if (Core.Policy.status(state).Tag == Core.Status.Tags.Paused) return;
-
-                // Reaching here means the unlock above was not a no-op, so Policy just reset
-                // its own armed/away/signal-health baseline for this unlock — the presence
-                // filter's spatial-coherence run and the freshness tracker's timestamp baseline
-                // must not survive across that same reset.
-                presenceFilterState = Core.PresenceFilter.initial;
-                frameFreshnessState = Core.FrameFreshness.initial;
-
-                // Resume paths always restart sampling (incident 2026-08-12), regardless of
-                // whether a camera is currently attached: the null-reader branch of SampleAsync
-                // exists precisely so a dead-camera state still emits NoFrame and drives the
-                // ordinary no-signal -> reevaluate -> restart recovery. A resume that only
-                // restarted the timer when reader was non-null left sampling permanently
-                // stopped whenever the camera died while paused/locked -- unpaused, reader
-                // null, timer stopped, no recovery possible.
-                if (reader is not null)
-                {
-                    // The camera deliberately stays alive across the lock: on this machine,
-                    // tearing down and re-initializing MediaCapture wedges the FrameServer
-                    // service itself (persistent E_HANDLE for every process until an elevated
-                    // service restart). Initialize once, never re-initialize.
-                    Log.Write("resumed after unlock (camera kept alive)");
-                }
-                else
-                {
-                    Log.Write("resumed after unlock (no camera — sampling resumes for signal-driven recovery)");
-                }
-                sampleTimer.Start();
-                // KickAcquisitionIfNeeded (0001-core-brain.md R2-4) — one of the three call
-                // sites sharing the core-owned status gate: names the mechanism today's code
-                // implements as a direct StartWatchingAsync() call, so the self-stopping retry
-                // timer isn't the only thing that can reacquire after a lock/pause.
-                KickAcquisitionIfNeeded();
+                sessionLocked = false;
+                Advance(Core.Event.Reconcile);
             }
         }, null);
 
@@ -651,71 +656,65 @@ sealed class WatcherContext : ApplicationContext
             if (Advance(Core.Event.CaptureFailed)) return; // Action.Restart executed — process exiting
             // Cooldown-suppressed backstop: tear down the dead capture (reader null) but keep
             // sampleTimer running — SampleAsync's null-reader path emits NoFrame, and the
-            // ordinary signal-health machinery carries the rest (no new mechanism). Every resume
-            // path (TogglePause, OnSessionSwitch unlock) now starts sampleTimer unconditionally,
-            // even when reader is null (incident 2026-08-12), so this backstop can no longer be
-            // stranded by a pause/lock that happens to land inside the restart cooldown. The
-            // sampling watchdog below is the second line of defense for any other starvation path
-            // (e.g. a hung SampleAsync pass) this comment doesn't cover.
+            // ordinary signal-health machinery carries the rest (no new mechanism). The
+            // Advance-internal suppression-transition rule (RFC 0002-environment-levels) starts
+            // sampleTimer unconditionally on every resume/unlock, even when reader is null
+            // (incident 2026-08-12), so this backstop can no longer be stranded by a pause/lock
+            // that happens to land inside the restart cooldown. The sampling watchdog below is
+            // the second line of defense for any other starvation path (e.g. a hung SampleAsync
+            // pass) this comment doesn't cover.
             TeardownCamera();
         }, null);
 
+    // RFC 0002-environment-levels, "Pause ownership": flips the shell-owned paused mirror and
+    // calls Advance(Reconcile) -- the pause takes effect and renders synchronously with the
+    // click, as before. The old resume branch's presence-filter/freshness resets and timer
+    // stop/start/KickAcquisitionIfNeeded ride the Advance-internal suppression-transition rule
+    // now (see Advance), so this call site no longer carries its own copy.
     void TogglePause()
     {
-        bool isPaused = Core.Policy.status(state).Tag == Core.Status.Tags.Paused;
-        if (!isPaused)
-        {
-            sampleTimer.Stop();
-            retryTimer.Stop();
-            Log.Write("paused");
-            Advance(Core.Event.Paused);
-        }
-        else
-        {
-            Log.Write("resumed");
-            Advance(Core.Event.Resumed);
-            // This branch only runs when actually leaving Paused (the isPaused check above),
-            // so Policy just reset its own baseline for this resume — same parity as the
-            // session-unlock path above.
-            presenceFilterState = Core.PresenceFilter.initial;
-            frameFreshnessState = Core.FrameFreshness.initial;
-            // Resume paths always restart sampling (incident 2026-08-12) -- see the identical
-            // comment in OnSessionSwitch's unlock branch. A reader-null resume still needs
-            // sampling running: SampleAsync's null-reader path emits NoFrame, which is what
-            // drives recovery when a camera died while paused.
-            sampleTimer.Start();
-            // KickAcquisitionIfNeeded — second of the three R2-4 call sites.
-            KickAcquisitionIfNeeded();
-        }
+        paused = !paused;
+        Advance(Core.Event.Reconcile);
     }
 
     // KickAcquisitionIfNeeded (0001-core-brain.md R2-4): the complete, core-owned gate for
     // "should we attempt (re)acquisition" — replaces the legacy shell-local
     // `!paused && !sessionLocked` booleans with the single status test shared by the retry
-    // timer's Tick guard and both direct call sites below.
+    // timer's Tick guard and Advance's suppression-transition rule (RFC 0002-environment-
+    // levels), the latter now the single call site for every resume/unlock path.
     void KickAcquisitionIfNeeded()
     {
         if (reader is null && PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state)))
             _ = StartWatchingAsync();
     }
 
-    // The single Advance(Event) chokepoint (0001-core-brain.md, slice 8b cutover): the only
-    // place `state` is reassigned. Computes now/nowWall back to back, calls Policy.step,
-    // executes the returned Action, logs Policy.snapshot alongside Lock/Restart (R1-34), logs
-    // the once-per-episode dark-vs-no-frame transition into Status.NoSignal (R2-29), and
-    // re-renders tray/status + pauseItem.Text from Policy.status — never from a shell-local
-    // bool. Returns true iff an Action.Restart was executed (the process is exiting via
-    // RestartProcess/ExitThread) so callers can skip any further work that assumes the process
-    // keeps running.
+    // The single Advance(Event) chokepoint (0001-core-brain.md, slice 8b cutover; RFC
+    // 0002-environment-levels for the StepInputs/StepContext cutover): the only place `state`
+    // is reassigned. Builds StepInputs via the one construction helper, calls Policy.step,
+    // executes the returned Action, logs Policy.snapshot alongside Lock/Restart (R1-34),
+    // implements the Advance-internal suppression-transition rule (round 3: filter/freshness
+    // resets, unconditional sample-timer restart, and KickAcquisitionIfNeeded on a suppressed
+    // -> unsuppressed transition; sample-timer stop on the reverse), logs the once-per-episode
+    // dark-vs-no-frame transition into Status.NoSignal (R2-29), and re-renders tray/status +
+    // pauseItem.Text from Policy.status — never from a shell-local bool. Returns true iff an
+    // Action.Restart was executed (the process is exiting via RestartProcess/ExitThread) so
+    // callers can skip any further work that assumes the process keeps running.
     bool Advance(Core.Event evt)
     {
-        long now = Environment.TickCount64;
-        long nowWallMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var monotonic = Core.MonotonicMs.NewMonotonicMs(now);
-        var nowWall = Core.WallClockMs.NewWallClockMs(nowWallMs);
+        // Threading invariant (RFC 0002-environment-levels, round 3): the single-writer
+        // soundness of the mirrors and `state` itself rests on every mirror mutation and
+        // Advance call executing on the UI thread. Fail-loud backstop, not the enforcement
+        // mechanism itself (the existing ui.Post discipline is).
+        Debug.Assert(SynchronizationContext.Current == ui, "Advance must run on the UI SynchronizationContext");
+
+        var inputs = BuildStepInputs();
+        var ctx = new Core.StepContext(
+            now: Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
+            nowWall: Core.WallClockMs.NewWallClockMs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+            inputs: inputs);
         var previousStatus = Core.Policy.status(state);
 
-        var result = Core.Policy.step(policyConfig, state, monotonic, nowWall, evt);
+        var result = Core.Policy.step(policyConfig, state, ctx, evt);
         state = result.State;
         var newStatus = Core.Policy.status(state);
 
@@ -728,10 +727,36 @@ sealed class WatcherContext : ApplicationContext
                 break;
             case Core.Action.Tags.Restart:
                 var restart = (Core.Action.Restart)result.Action;
-                ExecuteRestart(restart.reason, monotonic);
+                ExecuteRestart(restart.reason, ctx.Now);
                 return true;
             default:
                 throw new UnreachableException();
+        }
+
+        // Advance-internal suppression-transition rule (RFC 0002-environment-levels, round 3):
+        // implemented once, here, instead of hand-copied at every mirror-changing call site.
+        // Generalizes the 2026-07-28 burn-in fix (presence-filter/freshness resets) and the
+        // 2026-08-12 incident's unconditional sample-timer restart (the 1.0.8.4 fix semantics)
+        // to every suppressed -> unsuppressed transition Advance observes, including the
+        // WTS-reconciliation corrections slice 4 adds.
+        bool wasSuppressed = PolicyBridge.IsSuppressedStatus(previousStatus);
+        bool isSuppressed = PolicyBridge.IsSuppressedStatus(newStatus);
+        if (wasSuppressed && !isSuppressed)
+        {
+            // Transition log lives here, not at the mirror-changing call sites, for the same
+            // reason the rule itself does: one owner covers unlock, resume, and slice 4's
+            // WTS-reconciliation corrections alike (the log is this project's incident-forensics
+            // surface — a suppression exit must never be silent).
+            Log.Write($"suppression exited: {previousStatus} -> {newStatus}");
+            presenceFilterState = Core.PresenceFilter.initial;
+            frameFreshnessState = Core.FrameFreshness.initial;
+            sampleTimer.Start(); // unconditional -- idempotent if already running
+            KickAcquisitionIfNeeded();
+        }
+        else if (!wasSuppressed && isSuppressed)
+        {
+            Log.Write($"suppression entered: {previousStatus} -> {newStatus}");
+            sampleTimer.Stop();
         }
 
         // Status/log-line mapping table (slice 8b deliverable): the once-per-episode
@@ -936,11 +961,9 @@ sealed class WatcherContext : ApplicationContext
         retryTimer.Stop();
         deviceSettleTimer.Stop();
 
-        // Policy.status(state) == Paused is a reliable proxy for the core's internal IsPaused
-        // flag: Paused outranks every other Status in the priority table, so IsPaused true
-        // implies Status.Paused and vice versa — no need for Snapshot to expose IsPaused
-        // separately just for this.
-        bool isPaused = Core.Policy.status(state).Tag == Core.Status.Tags.Paused;
+        // RFC 0002-environment-levels, "Pause ownership": reads the shell's own pause mirror
+        // directly -- no more round-tripping through Policy.status.
+        bool isPaused = paused;
         var snap = Core.Policy.snapshot(policyConfig, state, Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64));
         // The shell writes only the stamp for the reason it executed (R1-29): Policy.step
         // itself only ever bumps the one RestartStamps field matching the fired reason, so

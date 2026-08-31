@@ -6,13 +6,20 @@ new-test mapping table covering both test projects, at **one-row-per-test-functi
 call sites the RFC explicitly names as the wrong unit — the seven fold-based property tests
 each wrap one textual call site exercised unboundedly per FsCheck run).
 
-Scope: MIGRATE phase only. `PresenceLock.Core.Tests/Tests.fs` and `Generators.fs` now call
-exclusively `Policy.startLevels`/`Policy.stepLevels` — zero references to `Policy.start`,
-`Policy.step`, `Event.SessionLocked`, `Event.SessionUnlocked`, `Event.Paused`,
-`Event.Resumed`, `.IsPaused`, or `.IsSessionLocked` remain in test code (some appear in prose
-comments documenting the old→new mapping at hand-rewritten call sites — never in executable
-code). `LevelsTests.fs` and all production code (`PresenceLock.Core`, the C# shell/tests) are
-untouched this phase; the CONTRACT phase deletes the legacy shape and cuts the shell over.
+Scope: the table below records the MIGRATE phase as it happened — `PresenceLock.Core.Tests/
+Tests.fs` and `Generators.fs` called exclusively `Policy.startLevels`/`Policy.stepLevels` at
+that point, with zero references to `Policy.start`, `Policy.step`, `Event.SessionLocked`,
+`Event.SessionUnlocked`, `Event.Paused`, `Event.Resumed`, `.IsPaused`, or `.IsSessionLocked`
+remaining in test code (some appear in prose comments documenting the old→new mapping at
+hand-rewritten call sites — never in executable code); `LevelsTests.fs` and all production
+code (`PresenceLock.Core`, the C# shell/tests) were untouched at that point. The CONTRACT
+phase (below, "PresenceLock.Tests (C#)") has since landed: `Policy.startLevels`/
+`Policy.stepLevels` are renamed to `Policy.start`/`Policy.step` (the old event-folded shape
+deleted outright — `Tests.fs`/`Generators.fs`/`LevelsTests.fs` all now call the canonical
+names), and the C# shell (`Program.cs`/`PolicyBridge.cs`) is cut over onto `StepInputs`/
+`StepContext`. The mapping table's "Policy.startLevels"/"Policy.stepLevels" references below
+describe the MIGRATE-phase state at the time and are left as the historical record; they are
+not stale claims about the current tree.
 
 Final tally: 80/80 green, across four files in `PresenceLock.Core.Tests`:
 `FrameFreshnessTests.fs` (8, untouched — no session/pause/legacy-API references),
@@ -90,13 +97,41 @@ assertions survive with their meaning intact, net of the deletions the RFC itsel
 |---|---|---|
 | `eventGen` | Updated | Removed `Event.SessionLocked`/`Event.SessionUnlocked`/`Event.Paused`/`Event.Resumed` from the generated alphabet (transitional-only in the levels path; deleted from the `Event` DU in the contract phase). Added `Event.Reconcile` in their place, preserving the "mostly no-op noise case" role the four events used to play for the generic properties that reuse `eventGen` (rows 49, 51, 52, 53 above). |
 
-## `PresenceLock.Tests` (C#) — PLANNED, contract phase
+## `PresenceLock.Tests` (C#) — DONE, contract phase
 
 | Old test | Disposition | Reason |
 |---|---|---|
-| `ClassifySampleTests.Constructs_a_Sample_event_carrying_the_classified_observation_and_idle_time` (`PolicyBridgeTests.cs:320`) | **Contract phase, planned deletion** | Asserts the `Event.Sample` idle payload (`sample.inputIdleMs`) that the contract phase deletes once `InputIdleMs` moves fully out of `Sample` and into `StepInputs` (RFC "Core contract changes": "`InputIdleMs` moves out of the `Sample` payload and into `StepInputs`"). Named in the RFC's slice-1 paragraph as the C# suite's exactly-one casualty, called out here in advance so the Windows-container gate's eventual failure is accounted for, not discovered mid-slice. No other `PresenceLock.Tests` class references the deleted session/pause events or the old `Policy.step`/`Policy.start` signatures — the C# shell code has not yet been rewired onto the levels contract (that is slice 4), so no other test is affected this phase. |
+| `ClassifySampleTests.Constructs_a_Sample_event_carrying_the_classified_observation_and_idle_time` (`PolicyBridgeTests.cs:320`) | **Deleted** | Asserted the `Event.Sample` idle payload (`sample.inputIdleMs`) deleted once `InputIdleMs` moved fully out of `Sample` and into `StepInputs` (RFC "Core contract changes": "`InputIdleMs` moves out of the `Sample` payload and into `StepInputs`"). Named in the RFC's slice-1 paragraph as the C# suite's exactly-one casualty. `PolicyBridge.ClassifySample` lost its `inputIdleMs` parameter to match (`ClassifySample(haveFrame, dark, present)`); `Program.cs`'s `SampleAsync` stops passing it — idle now flows only through `Advance`'s input assembly. |
+
+New tests added this phase (not migrations — new coverage for the contract cutover):
+
+| New test class | Reason |
+|---|---|
+| `StepInputsConstructionTests` (`PolicyBridgeTests.cs`) | RFC "Construction discipline": constructs `Core.StepInputs` via named arguments with each bool flipped independently off a known baseline, asserting every field of the result — the pinned safety net for the one-helper/named-arguments rule, landed *before* the mechanical shell cutover per the RFC's ordering. |
+| `IsSuppressedStatusTests` (`PolicyBridgeTests.cs`) | Covers the new `PolicyBridge.IsSuppressedStatus` predicate (`Paused`/`SessionLocked`) that `Advance`'s suppression-transition rule uses to detect the before/after status pair's edge — extracted to `PolicyBridge` to match the existing `IsAcquiringOrRecovering`/`ExpectsSampling` precedent (pure `Status` predicates, independently tested) rather than left as a private helper in `Program.cs`. |
+
+`Program.cs`/`PolicyBridge.cs` are cut over onto the renamed `Policy.start`/`Policy.step`
+and `StepInputs`/`StepContext`: new `sessionLocked`/`paused` shell-owned mirror fields; one
+`BuildStepInputs()` construction site (named arguments, `LockInhibited` hard-coded `false`
+until slice 5) used by both `Advance` and the startup `Policy.start` call; `Advance` opens
+with a `Debug.Assert` on the UI `SynchronizationContext` and implements the Advance-internal
+suppression-transition rule (filter/freshness resets + unconditional sample-timer restart +
+`KickAcquisitionIfNeeded` on a suppressed→unsuppressed transition; sample-timer stop on the
+reverse); the five session/pause `Advance(Event…)` call sites collapse to mirror-update +
+`Advance(Event.Reconcile)`; the constructor's pause consume-and-clear now feeds `Policy.start`
+directly (the `Event.Paused` refeed injection is deleted); `RestartProcess` reads the `paused`
+mirror instead of round-tripping through `Policy.status`.
 
 ## Verification
 
+MIGRATE phase:
+
 - `PresenceLock.Core.Tests` suite: 80/80 passing (`dotnet test PresenceLock.Core.Tests/PresenceLock.Core.Tests.fsproj -c Release`, Linux SDK container).
 - Zero code-level references remain in `Tests.fs`/`Generators.fs` to `Policy.step(`, `Policy.start(`, `Event.SessionLocked`, `Event.SessionUnlocked`, `Event.Paused` (as an event), `Event.Resumed`, `.IsPaused`, `.IsSessionLocked` — the only textual hits are inside `//`/`///` comments documenting the old→new mapping at the hand-rewritten call sites (rows 17–21, 34, 40, 50 above).
+
+CONTRACT phase (this update):
+
+- `PresenceLock.Core.Tests` suite (post-rename, legacy shape deleted): 80/80 passing, unchanged tally — the rename/deletion touched call sites and helpers, not test count.
+- `PresenceLock.csproj` (shell) cross-compile check, Linux SDK container: build succeeded, 0 warnings, 0 errors.
+- `PresenceLock.Tests` suite (Windows SDK container, `dotnet test PresenceLock.Tests\PresenceLock.Tests.csproj -c Release`): 80/80 passing (1 deleted — `ClassifySampleTests`; 6 added — `StepInputsConstructionTests` ×4, `IsSuppressedStatusTests` ×2 — net +5 over the pre-phase count of 75).
+- Zero code-level references remain anywhere in `PresenceLock.Core`, `PresenceLock.Core.Tests`, `Program.cs`, `PolicyBridge.cs`, or `PresenceLock.Tests` to `Event.SessionLocked`/`Event.SessionUnlocked`/`Event.Paused`/`Event.Resumed` (as constructors), `State.IsPaused`/`.IsSessionLocked`, or `Policy.stepLevels`/`Policy.startLevels` — the only textual hits left anywhere are inside comments documenting the old→new mapping (this file's historical MIGRATE-phase table, and a handful of "old `Event.X` → levels `StepInputs.Y`" translation notes in `Tests.fs`).

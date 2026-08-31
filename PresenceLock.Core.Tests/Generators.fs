@@ -52,20 +52,16 @@ let observationGen : Gen<Observation> =
           Observation.NoFrame
           Observation.DarkFrame ]
 
-/// RFC 0002-environment-levels, slice 1 (MIGRATE): the four session/pause events
-/// (`SessionLocked`/`SessionUnlocked`/`Paused`/`Resumed`) are no longer generated here --
-/// they are transitional-only in the levels path (decision-state no-ops; see `Policy.dispatch`)
-/// and are deleted from the `Event` DU outright in the contract phase. `Event.Reconcile`
-/// takes their place in the generated alphabet as the "mostly no-op, but re-derives status"
-/// noise case the four old events used to play for the properties that reuse this generator
-/// generically (properties 5, 6, 9, 12 in Tests.fs).
+/// RFC 0002-environment-levels: the four session/pause events (`SessionLocked`/
+/// `SessionUnlocked`/`Paused`/`Resumed`) are deleted from the `Event` DU -- suppression is
+/// derived from `StepInputs`, not from events. `Event.Reconcile` takes their place in the
+/// generated alphabet as the "mostly no-op, but re-derives status" noise case the four old
+/// events used to play for the properties that reuse this generator generically (properties
+/// 5, 6, 9, 12 in Tests.fs). `Event.Sample` no longer carries an idle payload -- `InputIdleMs`
+/// lives in `StepInputs` and is generated/threaded separately by callers that need it.
 let eventGen : Gen<Event> =
     Gen.oneof
-        [ gen {
-            let! observation = observationGen
-            let! inputIdleMs = Gen.choose (0, 3_600_000)
-            return Event.Sample(observation, int64 inputIdleMs)
-          }
+        [ Gen.map Event.Sample observationGen
           Gen.constant Event.InitSucceeded
           Gen.map Event.InitFailed Arb.generate<bool>
           Gen.constant Event.CaptureFailed

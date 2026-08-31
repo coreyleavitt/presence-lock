@@ -157,6 +157,14 @@ static class PolicyBridge
     internal static bool IsAcquiringOrRecovering(Core.Status status) =>
         status.Tag == Core.Status.Tags.AcquiringCamera || status.Tag == Core.Status.Tags.Recovering;
 
+    /// Suppression per the Status priority table (0001-core-brain.md / RFC 0002-environment-
+    /// levels "Status"): `Paused` and `SessionLocked` are the two rows sampling stops for.
+    /// Used by `Advance`'s suppression-transition rule (filter/freshness resets, sample-timer
+    /// stop/start, `KickAcquisitionIfNeeded`) to detect the before/after status pair's edge
+    /// without duplicating the priority-row list inline.
+    internal static bool IsSuppressedStatus(Core.Status status) =>
+        status.Tag == Core.Status.Tags.Paused || status.Tag == Core.Status.Tags.SessionLocked;
+
     /// The sampling watchdog's status gate (incident 2026-08-12: a resume path that only
     /// restarted `sampleTimer` when `reader is not null` left it permanently stopped after a
     /// camera died inside the restart cooldown while paused). True exactly for the statuses
@@ -252,9 +260,11 @@ static class PolicyBridge
     }
 
     /// `SampleAsync`'s shared event-construction function — the `ClassifySample(...): Event`
-    /// named in the RFC's slice 8a contract.
-    internal static Core.Event ClassifySample(bool haveFrame, bool dark, bool present, long inputIdleMs) =>
-        Core.Event.NewSample(ClassifyObservation(haveFrame, dark, present), inputIdleMs);
+    /// named in the RFC's slice 8a contract. `InputIdleMs` no longer flows through here (RFC
+    /// 0002-environment-levels): it lives in `StepInputs`, sourced fresh in `Advance`'s input
+    /// assembly, not in the `Sample` payload.
+    internal static Core.Event ClassifySample(bool haveFrame, bool dark, bool present) =>
+        Core.Event.NewSample(ClassifyObservation(haveFrame, dark, present));
 
     /// Bug fix (frozen-frame classification): `TryAcquireLatestFrame` can re-serve a cached
     /// frame forever (a known WinRT quirk) — a frame whose `Core.FrameFreshness` verdict is
@@ -414,12 +424,14 @@ static class PolicyBridge
         }
     }
 
-    /// Paused-flag consume-and-clear (0001-core-brain.md R2-11, pinned lifecycle): reads the
-    /// persisted flag; if set, immediately rewrites the file with it cleared (stamps untouched)
-    /// and returns true so the caller feeds `Event.Paused` through `Advance` right after
-    /// `Policy.start`. Returns false — and touches nothing on disk — when absent/false/unparseable,
-    /// so a normal launch or a tray Exit never inherits a stale pause, and a parse failure
-    /// never blocks startup. Called exactly once, from `WatcherContext`'s constructor.
+    /// Paused-flag consume-and-clear (0001-core-brain.md R2-11 / RFC 0002-environment-levels
+    /// "Pause ownership", pinned lifecycle): reads the persisted flag; if set, immediately
+    /// rewrites the file with it cleared (stamps untouched) and returns true, which the caller
+    /// assigns directly to its `paused` mirror before building the initial `StepInputs` for
+    /// `Policy.start` — inheritance is ordinary input passing now, not an event refeed. Returns
+    /// false — and touches nothing on disk — when absent/false/unparseable, so a normal launch
+    /// or a tray Exit never inherits a stale pause, and a parse failure never blocks startup.
+    /// Called exactly once, from `WatcherContext`'s constructor.
     internal static bool ConsumePersistedPausedFlag()
     {
         try
