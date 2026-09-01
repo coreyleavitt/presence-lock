@@ -373,7 +373,11 @@ Pinned details:
   offset 0, four padding bytes, `SessionId`@8, `SessionState`@12, `SessionFlags`@16.
   A naive offset-4 read returns `SessionState` where `SessionFlags` is expected and
   reads as a plausible wrong answer (the probe's own first version made exactly this
-  error; `WTSActive = 0` masquerades as `WTS_SESSIONSTATE_LOCK`). The
+  error; `WTSActive = 0` masquerades as `WTS_SESSIONSTATE_LOCK`). A full unlock
+  transition was also observed live: `SessionFlags` flipped to 1 roughly two seconds
+  before the LogonUI process exited — direct evidence that WTS state and UI-visible
+  lock state skew around transitions, supporting the two-tick hysteresis and the
+  SessionSwitch-adjacency skip window. The
   fast-user-switch/RDP observation requires a second interactive session and is
   deferred to slice 6's live smoke (recorded in the handoff as an open item, not
   silently dropped).

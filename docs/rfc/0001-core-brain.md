@@ -109,6 +109,11 @@ type Event =
     /// payload: post-success, the restart decision no longer depends on the failure's
     /// classification — see "Notes: recovery boundary."
     | CaptureFailed
+    // SUPERSEDED by 0002-environment-levels.md (StepInputs/Reconcile): these four
+    // session/pause cases are removed from the Event DU. Session-lock and pause are no
+    // longer edge events folded into State — they are sampled levels (StepInputs.SessionLocked
+    // / .Paused) read fresh on every step, with a single Reconcile event replacing all four
+    // for "the levels may have changed, re-evaluate."
     | SessionLocked
     | SessionUnlocked
     | Paused
@@ -228,6 +233,15 @@ Notes:
   no-op — it does not re-baseline, arm, or change `Status` away from `Paused` — matching
   `Program.cs`'s `if (paused) return;` guard in `OnSessionSwitch`. Pause takes precedence over
   an unlock-driven resume; only an explicit `Resumed` event clears it. Truth table:
+
+  > **SUPERSEDED by 0002-environment-levels.md (StepInputs/Reconcile).** This entire truth
+  > table — including the "`SessionUnlocked` while paused is a no-op" row that follows —
+  > is the root cause the later RFC's Motivation names: a folded belief (`IsPaused`/
+  > `IsSessionLocked`) has no way to re-synchronize with truth once an edge is swallowed,
+  > and this table's precedence rule was the specified, tested behavior that produced the
+  > 2026-08-17 incident. It no longer describes current behavior: session-lock and pause
+  > are sampled levels, `suppressed inputs = inputs.SessionLocked || inputs.Paused` is a
+  > plain order-independent OR, and there is no precedence sub-case to specify.
 
   | Event            | while Paused        | while not Paused                    |
   |-------------------|---------------------|--------------------------------------|
@@ -521,7 +535,11 @@ Validation, in the shell at load time, before ever calling `Policy.start`:
   7. A continuous run of `NoFace` observations shorter than `AwayThresholdMs` never locks,
      regardless of armed/grace/idle state (continuity, not just the four gates individually).
   8. `Sample` events while `Status` is `SessionLocked` or `Paused` never change the armed/grace
-     baseline and never emit `Action.Lock`.
+     baseline and never emit `Action.Lock`. **SUPERSEDED by 0002-environment-levels.md
+     (StepInputs/Reconcile):** this property is superseded by property 13 (status/level
+     agreement over the full six-row priority table, plus `lockInhibited` agreement), which
+     asserts the same claim over sampled `StepInputs` rather than folded `Status` flags, across
+     an exhaustively explored state graph rather than this property's generated sequences.
   9. If `Action.Lock` is emitted for a `Sample` and no `SessionLocked` follows, an identical
      subsequent `Sample` re-emits `Action.Lock` (no internal latch).
 - `pack.ps1` gains a container `dotnet test` gate before publish; a failing core test fails
@@ -597,7 +615,11 @@ Validation, in the shell at load time, before ever calling `Policy.start`:
    `PolicyConfig`/`Event` introduced here (reused by every later slice); tests: baseline
    state is unarmed, in grace, per `Policy.snapshot`. `State`'s private record sketches its
    **full final shape** (fields needed through slice 6 — signal/recovery baselines, pause
-   flag, stamps) even though only the baseline subset is exercised here.
+   flag, stamps) even though only the baseline subset is exercised here. **SUPERSEDED by
+   0002-environment-levels.md (StepInputs/Reconcile):** the folded `pause`/session-locked
+   booleans this sketch describes are gone from `State`'s actual current shape — replaced by
+   `LastInputs: StepInputs`, the previous call's sampled levels, with exactly one writer
+   (`step` itself).
 3. **Lock rules (Sample-only scenarios)**: `step` for `Sample`/`InitSucceeded` events — armed
    transition, away threshold, input-idle gate, grace baselined from `InitSucceeded`; table
    tests restricted to what's expressible without `SessionUnlocked`/`Resumed`/recovery events
