@@ -1,6 +1,6 @@
 # RFC: Environment levels and lock inhibitors
 
-Status: In-progress (stage 1 drafted + sliced; round-1 architect review applied 2026-08-17; rounds 2–3 applied 2026-08-18; implementation started 2026-08-31)
+Status: Implemented (all 6 slices landed 2026-08-31; 1.1.0.0 installed and live-smoked same day; stage-4 code review pending, to run over this scope together with 0001-core-brain.md's)
 Depends on: 0001 (supersedes its session/pause event contract; its decision-state,
 signal-health, and recovery contracts are unchanged and remain authoritative).
 
@@ -573,6 +573,12 @@ catch here, not mid-slice). Record the answers as known-limitation notes alongsi
 ones below — edits to this RFC's list, in the slice-5 commit, never commit-message-only;
 if (a) shows staleness, re-acquire the manager on resume (one
 `SystemEvents.PowerModeChanged` hook) rather than shipping a sticky level.
+**Spike results so far (2026-08-31, installed 1.1.0.0):** (c) confirmed — the packaged
+app (manifest declaring only `runFullTrust` and `webcam`) acquired the SMTC manager and
+detected live playback with no additional capability; the inhibitor activated within
+one watchdog tick of playback starting and cleared within one tick of the player
+pausing, both logged. (a) sleep/resume and (b) fast-user-switch scoping remain pending
+an interactive session (tracked in the handoff's open forks).
 
 Known limitations, accepted:
 
