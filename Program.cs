@@ -24,8 +24,31 @@ static class Program
     [STAThread]
     static void Main()
     {
+        // SEC-1 (reframed): `new Mutex(true, name, out createdNew)` grants initial ownership
+        // only when createdNew is true; when false (a name collision), initiallyOwned is
+        // ignored and no wait is performed -- so this constructor can never throw
+        // AbandonedMutexException on this path (that exception is only possible from a WaitOne
+        // call contending for an already-held mutex, and there is no such call site for
+        // SingleInstance anywhere in this project: it is only ever constructed here, then later
+        // ReleaseMutex()'d/Dispose()'d from RestartProcess). What WAS broken: `if (!createdNew)
+        // return;` used to exit completely silently, before WatcherContext's constructor (the
+        // first other Log.Write call site) ever ran -- indistinguishable, from the log, between
+        // "a legitimate second instance politely declined to start" and "something is squatting
+        // the mutex name and this process can never run at all." This app's threat model is
+        // same-user local code (see CLAUDE.md); that can always squat a well-known mutex name,
+        // and this fix does not attempt to stop it -- it only removes the silent, trace-less
+        // failure. `Log` is a fully self-contained static class (its own file path, its own
+        // Directory.CreateDirectory) with no dependency on WatcherContext having been
+        // constructed, so logging here needs no special arrangement.
         SingleInstance = new Mutex(initiallyOwned: true, @"Local\PresenceLock", out bool createdNew);
-        if (!createdNew) return;
+        if (!createdNew)
+        {
+            Log.Write("startup aborted: the Local\\PresenceLock single-instance mutex is already " +
+                      "held -- either another instance is already running, or something else " +
+                      "(legitimate or not) holds a mutex of that name; same-user code can always " +
+                      "do this, so this line exists for diagnosability, not as a defense");
+            return;
+        }
 
         ApplicationConfiguration.Initialize();
         Application.Run(new WatcherContext());
@@ -114,7 +137,29 @@ static class Log
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
                 if (File.Exists(FilePath) && new FileInfo(FilePath).Length > 1_000_000)
-                    File.Delete(FilePath);
+                {
+                    // SEC-6: keep one rolled generation instead of outright deleting the only
+                    // diagnostic trail on rotation. Any same-user process can still delete or
+                    // truncate either file at will (no append-only/ACL protection attempted --
+                    // that needs OS ACLs, out of scope) -- but an ordinary size-triggered
+                    // rotation must not itself be what destroys the log.
+                    //
+                    // Rotation gets its OWN try/catch so that a failed rotate (e.g. another
+                    // process holding `.1` open) degrades to "append to the oversized primary"
+                    // rather than dropping this line AND every subsequent line until the lock
+                    // clears -- the append below must run whether or not the roll succeeded.
+                    try
+                    {
+                        string backupPath = FilePath + ".1";
+                        File.Delete(backupPath); // no-op if absent; keep exactly one prior generation
+                        File.Move(FilePath, backupPath);
+                    }
+                    catch
+                    {
+                        // Keep writing to the primary; it will simply exceed the cap until the
+                        // next write that can successfully roll it.
+                    }
+                }
                 File.AppendAllText(FilePath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}");
             }
         }
@@ -217,27 +262,37 @@ sealed class WatcherContext : ApplicationContext
     Core.PolicyConfig policyConfig;
     Core.State state;
     // Environment-level mirrors (RFC 0002-environment-levels, "Session mirror with
-    // reconciliation" / "Pause ownership"): the shell owns these as plain bools, sampled fresh
-    // into a `Core.StepInputs` on every `Advance` call via `BuildStepInputs` -- never folded
-    // into `Core.State` itself. `sessionLocked` is seeded from the constructor's synchronous
-    // startup WTS query (slice 4, `AssembleStartupInputs`) -- fail-open, so a failed startup
-    // query leaves it at its safe default, false. Updated thereafter by `OnSessionSwitch` and
-    // by watchdog-tick WTS reconciliation corrections (`PolicyBridge.ReconciliationStep`).
-    // `paused` starts from `ConsumePersistedPausedFlag` in the constructor.
-    bool sessionLocked;
+    // reconciliation" / "Pause ownership"): the shell owns these, sampled fresh into a
+    // `Core.StepInputs` on every `Advance` call via `BuildStepInputs` -- never folded into
+    // `Core.State` itself. `sessionLockMirror` owns the session-lock mirror and its WTS-
+    // reconciliation bookkeeping as one unit (`PolicyBridge.SessionLockMirror`, DES-2): what
+    // used to be three loose fields here -- `sessionLocked`/
+    // `ticksSinceLastSessionSwitchMirrorChange`/`sessionLockDisagreementCount` -- mutated from
+    // three call sites (this constructor's startup seed, `OnSessionSwitch`, and the watchdog
+    // tick's WTS reconciliation) with only a comment conceding "these change together" as
+    // convention, not structure. One type now owns them structurally, mirroring
+    // `LockInhibitorRegistry`'s precedent one slice later. `Locked` is seeded from the
+    // constructor's synchronous startup WTS query (slice 4, `AssembleStartupInputs`) -- fail-
+    // open, so a failed startup query leaves it at its safe default, false. Updated thereafter
+    // by `OnSessionSwitch` and by watchdog-tick WTS reconciliation corrections
+    // (`SessionLockMirror.Reconcile`, delegating to the unchanged `PolicyBridge.
+    // ReconciliationStep`) -- both already UI-thread-only call sites (the threading invariant
+    // `Advance` asserts), so `SessionLockMirror` itself needs no locking of its own. `paused`
+    // starts from `ConsumePersistedPausedFlag` in the constructor.
+    // DES-2b: this inline initializer IS unconditionally overwritten below, before any read,
+    // by the real startup WTS query's result -- one throwaway `SessionLockMirror` allocated per
+    // startup for no behavioral benefit. Deliberately kept anyway: this constructor's
+    // watchdogTimer.Tick/OnSessionSwitch closures (declared earlier in the constructor, capturing
+    // this field) are compiled against the field's nullable flow-state at their own textual
+    // position, not their invocation time -- removing the initializer turns this field's
+    // non-nullable `SessionLockMirror` type into a real CS8602-flagged "possibly null" at every
+    // closure read (confirmed by trying it), exactly the same class of reasoning the
+    // `inhibitorRegistry` field comment above documents for why IT is assigned early. Trading a
+    // real, permanent warning for a one-time-per-process throwaway allocation is not a good
+    // trade -- this is a trivial micro-opt, not worth the risk DES-2b itself says to weigh it
+    // against.
+    readonly SessionLockMirror sessionLockMirror = new(initialLocked: false);
     bool paused;
-    // WTS reconciliation bookkeeping (RFC 0002-environment-levels, "Session mirror with
-    // reconciliation"), read/written ONLY by the watchdog tick and `OnSessionSwitch` -- both
-    // already UI-thread-only call sites (the threading invariant `Advance` asserts). Ticks
-    // since the last SessionSwitch-driven update that actually CHANGED `sessionLocked` (round-3
-    // boundary rule 2's skip window; see `PolicyBridge.SessionSwitchTicksAfterDelivery`).
-    // Starts at 1 (not 0): at process start no SessionSwitch has fired at all, so the very
-    // first watchdog tick must not be treated as "adjacent to a session switch."
-    int ticksSinceLastSessionSwitchMirrorChange = 1;
-    // Consecutive watchdog ticks the WTS query has disagreed with `sessionLocked`
-    // (`PolicyBridge.ReconciliationStep`'s two-tick hysteresis counter; round-3 boundary rule 1
-    // holds this across a failed query rather than resetting it).
-    int sessionLockDisagreementCount;
     // Inhibitor registry (RFC 0002-environment-levels, "Inhibitor registry"): built once in the
     // constructor from the configured providers (media playback, kill-switch gated -- see
     // MediaInhibitorProvider). `Refresh()` runs ONLY from the watchdog tick
@@ -340,6 +395,13 @@ sealed class WatcherContext : ApplicationContext
 
     [DllImport("user32.dll")]
     static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    // De-duplicates `Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64)`, repeated verbatim
+    // at every call site in this class that needs "now" in the monotonic domain (Advance's
+    // StepContext, snapshot/log call sites, and the presence-filter/freshness steps in
+    // SampleAsync). Pure de-duplication -- every call site reads the identical live
+    // Environment.TickCount64, so this changes no behavior.
+    static Core.MonotonicMs NowMonotonic() => Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64);
 
     static long InputIdleMs()
     {
@@ -466,7 +528,7 @@ sealed class WatcherContext : ApplicationContext
     // here on every Advance call, matching every other level in StepInputs; only Refresh()
     // itself is watchdog-tick-cadence.
     Core.StepInputs BuildStepInputs() =>
-        BuildStepInputs(sessionLocked, paused, lockInhibited: inhibitorRegistry.Active, inputIdleMs: InputIdleMs());
+        BuildStepInputs(sessionLockMirror.Locked, paused, lockInhibited: inhibitorRegistry.Active, inputIdleMs: InputIdleMs());
 
     // Startup input-assembly ordering (RFC 0002-environment-levels, "Construction discipline"
     // pinned test / "Session mirror with reconciliation" startup bullet): pause consume-and-
@@ -607,13 +669,12 @@ sealed class WatcherContext : ApplicationContext
                 reconcile: () =>
                 {
                     var wtsResult = QuerySessionLocked();
-                    var reconciliation = PolicyBridge.ReconciliationStep(
-                        mirror: sessionLocked,
-                        queriedLocked: wtsResult.Locked,
-                        querySucceeded: wtsResult.Succeeded,
-                        ticksSinceLastSessionSwitchMirrorChange: ticksSinceLastSessionSwitchMirrorChange,
-                        consecutiveDisagreementCount: sessionLockDisagreementCount);
-                    sessionLockDisagreementCount = reconciliation.DisagreementCount;
+                    // DES-2: SessionLockMirror.Reconcile owns the mirror/ticks/disagreement-count
+                    // trio and delegates the actual decision to PolicyBridge.ReconciliationStep
+                    // unchanged -- this closure only executes the verdict (log + Advance), exactly
+                    // as it did against the loose fields before extraction.
+                    var reconciliation = sessionLockMirror.Reconcile(
+                        querySucceeded: wtsResult.Succeeded, queriedLocked: wtsResult.Locked);
                     if (reconciliation.CorrectionApplied)
                     {
                         // Corrections drive behavior, not just the bool (RFC): mirror update then
@@ -624,16 +685,10 @@ sealed class WatcherContext : ApplicationContext
                         // warning: it is itself a signal worth seeing (a missed SessionSwitch
                         // edge just self-healed).
                         Log.Write($"WARNING: WTS reconciliation correcting sessionLocked mirror " +
-                                  $"{sessionLocked} -> {reconciliation.Mirror} (OS query disagreed for two " +
+                                  $"{reconciliation.OldLocked} -> {reconciliation.NewLocked} (OS query disagreed for two " +
                                   "consecutive watchdog ticks)");
-                        sessionLocked = reconciliation.Mirror;
                         Advance(Core.Event.Reconcile);
                     }
-                    // One more watchdog interval has now elapsed since the last mirror-changing
-                    // SessionSwitch delivery (or since startup, per the field's initial value of
-                    // 1) -- advanced here, once per tick, after this tick's own reconciliation
-                    // already read the pre-increment value.
-                    ticksSinceLastSessionSwitchMirrorChange++;
                 },
                 refreshInhibitors: () =>
                 {
@@ -651,8 +706,10 @@ sealed class WatcherContext : ApplicationContext
                 runSamplingWatchdogStep: () =>
                 {
                     // Live from cfg (not captured once) so a Settings change to SampleIntervalMs
-                    // is picked up on the very next tick.
-                    long starvationMs = Math.Max(10L * cfg.SampleIntervalMs, 15000);
+                    // is picked up on the very next tick. See
+                    // PolicyBridge.SamplingStarvationThresholdMs for the rationale behind the
+                    // 10x/15s-floor computation.
+                    long starvationMs = PolicyBridge.SamplingStarvationThresholdMs(cfg.SampleIntervalMs);
                     var verdict = PolicyBridge.SamplingWatchdogStep(
                         expectsSampling: PolicyBridge.ExpectsSampling(Core.Policy.status(state)),
                         nowMs: Environment.TickCount64,
@@ -719,9 +776,13 @@ sealed class WatcherContext : ApplicationContext
         var startup = AssembleStartupInputs(
             PolicyBridge.ConsumePersistedPausedFlag, QuerySessionLocked, InputIdleMs);
         paused = startup.Paused;
-        sessionLocked = startup.SessionLocked;
+        sessionLockMirror = new SessionLockMirror(startup.SessionLocked);
+        // SEC-4: an unexpected paused start must be diagnosable, not silent — see
+        // PolicyBridge.StartupPauseInheritedWarning's comment for the full rationale.
+        var pauseWarning = PolicyBridge.StartupPauseInheritedWarning(paused);
+        if (pauseWarning is not null) Log.Write(pauseWarning);
         state = Core.Policy.start(
-            Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
+            NowMonotonic(),
             PolicyBridge.LoadRestartStamps(),
             startup.Inputs);
         presenceFilterState = Core.PresenceFilter.initial;
@@ -767,7 +828,7 @@ sealed class WatcherContext : ApplicationContext
             bool handleInvalid = PolicyBridge.IsHandleInvalid(ex);
             if (Advance(Core.Event.NewInitFailed(handleInvalid))) return; // Action.Restart executed — process exiting
 
-            var snap = Core.Policy.snapshot(policyConfig, state, Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64));
+            var snap = Core.Policy.snapshot(policyConfig, state, NowMonotonic());
             Log.Write($"start failed ({snap.InitFailStreak}, hr=0x{ex.HResult:X8}, t{Environment.CurrentManagedThreadId}): {ex.Message.Trim()}");
 
             if (reader is null && PolicyBridge.IsAcquiringOrRecovering(Core.Policy.status(state)))
@@ -889,7 +950,9 @@ sealed class WatcherContext : ApplicationContext
         // than pay for a frame acquisition and face-detection pass that can't matter — the
         // sampleTimer is stopped in both states anyway, so this only guards a narrow race.
         var currentStatus = Core.Policy.status(state);
-        if (currentStatus.Tag == Core.Status.Tags.Paused || currentStatus.Tag == Core.Status.Tags.SessionLocked) return;
+        // DES-3: was an inline byte-duplicate of PolicyBridge.IsSuppressedStatus's priority-row
+        // list -- that helper exists precisely so this list is never hand-copied a second time.
+        if (PolicyBridge.IsSuppressedStatus(currentStatus)) return;
         sampling = true;
         try
         {
@@ -913,7 +976,7 @@ sealed class WatcherContext : ApplicationContext
                     {
                         var freshness = Core.FrameFreshness.step(
                             Core.FreshnessConfig.Default, frameFreshnessState,
-                            Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64), frameTime.Value.Ticks);
+                            NowMonotonic(), frameTime.Value.Ticks);
                         frameFreshnessState = freshness.State;
                         frameIsFresh = freshness.IsFresh;
                     }
@@ -935,7 +998,7 @@ sealed class WatcherContext : ApplicationContext
                                 faces.Select(f => f.FaceBox).ToList(), (uint)gray.PixelWidth, (uint)gray.PixelHeight);
                             var filterResult = Core.PresenceFilter.step(
                                 Core.FilterConfig.Default, presenceFilterState,
-                                Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64), box);
+                                NowMonotonic(), box);
                             presenceFilterState = filterResult.State;
                             present = filterResult.StablePresence;
                         }
@@ -999,23 +1062,27 @@ sealed class WatcherContext : ApplicationContext
         {
             if (e.Reason == SessionSwitchReason.SessionLock)
             {
-                bool changed = !sessionLocked;
-                sessionLocked = true;
-                // Round-3 boundary rule 2: the skip window restarts ONLY when this delivery
-                // actually changed the mirror -- an idempotent duplicate SessionSwitch
-                // re-delivery (Windows demonstrably double-fires it) must leave the counter
-                // running, not restart it.
-                ticksSinceLastSessionSwitchMirrorChange =
-                    PolicyBridge.SessionSwitchTicksAfterDelivery(changed, ticksSinceLastSessionSwitchMirrorChange);
-                Advance(Core.Event.Reconcile);
+                // DES-2/SHELL-1: SessionLockMirror.OnSessionSwitch owns the mirror-plus-skip-
+                // window update -- round-3 boundary rule 2 (the skip window restarts ONLY when
+                // this delivery actually changed the mirror; an idempotent duplicate
+                // SessionSwitch re-delivery, which Windows demonstrably double-fires, must leave
+                // the counter running, not restart it) lives there, delegating to the unchanged
+                // `PolicyBridge.SessionSwitchTicksAfterDelivery`. Advance is gated on the
+                // returned `changed` flag -- matching the other two mirror-changing sites (WTS
+                // reconciliation gates on `CorrectionApplied`; inhibitor aggregation gates on
+                // `Refresh()`'s own `changed`) -- so a duplicate/idempotent delivery, a genuine
+                // no-op for this mirror, does no redundant work. A delivery that DOES change the
+                // mirror always returns true here, so the suppression-exit transition (filter
+                // reset, sample-timer restart, KickAcquisitionIfNeeded -- riding Advance's
+                // internal transition rule) is never skipped for a real lock/unlock, only for a
+                // true repeat.
+                if (sessionLockMirror.OnSessionSwitch(locked: true))
+                    Advance(Core.Event.Reconcile);
             }
             else if (e.Reason == SessionSwitchReason.SessionUnlock)
             {
-                bool changed = sessionLocked;
-                sessionLocked = false;
-                ticksSinceLastSessionSwitchMirrorChange =
-                    PolicyBridge.SessionSwitchTicksAfterDelivery(changed, ticksSinceLastSessionSwitchMirrorChange);
-                Advance(Core.Event.Reconcile);
+                if (sessionLockMirror.OnSessionSwitch(locked: false))
+                    Advance(Core.Event.Reconcile);
             }
         }, null);
 
@@ -1083,11 +1150,36 @@ sealed class WatcherContext : ApplicationContext
         // soundness of the mirrors and `state` itself rests on every mirror mutation and
         // Advance call executing on the UI thread. Fail-loud backstop, not the enforcement
         // mechanism itself (the existing ui.Post discipline is).
-        Debug.Assert(SynchronizationContext.Current == ui, "Advance must run on the UI SynchronizationContext");
+        //
+        // DES-1: a bare `Debug.Assert` is `[Conditional("DEBUG")]` and this app ships
+        // `-c Release` with no DEBUG define, so a bare assert here compiles OUT of the shipped
+        // binary entirely -- a real cross-thread call would corrupt the mirrors/registry/`state`
+        // in complete silence, exactly the "expected behavior existed only as code" defect class
+        // this codebase exists to eliminate. This is a genuine data-race invariant with no safe
+        // continuation: `Policy.step` reassigning `state` (and any mirror mutation) off the UI
+        // thread can race a concurrent UI-thread `Advance`/mirror write with no synchronization
+        // between them, so a log-and-continue would let that race actually happen, just with a
+        // line in the log after the fact -- strictly worse than crashing loudly before any
+        // corruption occurs. Fail fast with `Environment.FailFast`, not a `throw`: three of
+        // Advance's callers wrap it in a catch-all `try/catch` that logs and continues (e.g.
+        // StartWatchingAsync's InitSucceeded/InitFailed paths), so a catchable exception would
+        // be swallowed on exactly those paths and the "must not silently continue" guarantee
+        // would hold only for some callers. FailFast is uncatchable and uniform: it bypasses
+        // every enclosing catch/finally, writes to the Windows Event Log, and produces a crash
+        // dump. Log first anyway, so the failure is diagnosable from Log's own file even if WER
+        // capture is unavailable in some deployment; keep `Debug.Assert` alongside for its value
+        // under a DEBUG-build debugger (breaks in place rather than tearing down).
+        if (SynchronizationContext.Current != ui)
+        {
+            Log.Write("FATAL: Advance called off the UI SynchronizationContext -- the single-" +
+                      "writer invariant over the mirrors/registry/state has been violated");
+            Debug.Assert(false, "Advance must run on the UI SynchronizationContext");
+            Environment.FailFast("Advance must run on the UI SynchronizationContext");
+        }
 
         var inputs = BuildStepInputs();
         var ctx = new Core.StepContext(
-            now: Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64),
+            now: NowMonotonic(),
             nowWall: Core.WallClockMs.NewWallClockMs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
             inputs: inputs);
         var previousStatus = Core.Policy.status(state);
@@ -1160,7 +1252,7 @@ sealed class WatcherContext : ApplicationContext
     void ExecuteLock()
     {
         sampleTimer.Stop();
-        var snap = Core.Policy.snapshot(policyConfig, state, Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64));
+        var snap = Core.Policy.snapshot(policyConfig, state, NowMonotonic());
         Log.Write($"no face for {cfg.AwayThresholdSeconds}s, input idle — locking " +
                   $"(armed={snap.Armed} inGrace={snap.InGrace} awayForMs={snap.AwayForMs} " +
                   $"noSignalForMs={snap.NoSignalForMs} initFailStreak={snap.InitFailStreak})");
@@ -1349,7 +1441,7 @@ sealed class WatcherContext : ApplicationContext
         // RFC 0002-environment-levels, "Pause ownership": reads the shell's own pause mirror
         // directly -- no more round-tripping through Policy.status.
         bool isPaused = paused;
-        var snap = Core.Policy.snapshot(policyConfig, state, Core.MonotonicMs.NewMonotonicMs(Environment.TickCount64));
+        var snap = Core.Policy.snapshot(policyConfig, state, NowMonotonic());
         // The shell writes only the stamp for the reason it executed (R1-29): Policy.step
         // itself only ever bumps the one RestartStamps field matching the fired reason, so
         // snap.LastWedgeRestartAt/LastReevalRestartAt already carry that property — a plain

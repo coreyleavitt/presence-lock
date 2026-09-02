@@ -358,8 +358,11 @@ of failing visibly.
 Every mirror mutation, registry access, and `Advance` call must execute on the UI
 thread — the existing `ui.Post` discipline is a rule, not just a pattern, because the
 single-writer soundness of the mirrors, the inhibitor registry snapshot, and `State`
-itself all rest on it. `Advance` opens with `Debug.Assert(SynchronizationContext.Current
-== ui, ...)` as the fail-loud backstop; any future async continuation that touches a
+itself all rest on it. `Advance` opens with an explicit off-thread check that logs a
+`FATAL:` line, asserts under a debug build, then throws — a fail-loud backstop that
+survives the Release build (a bare `Debug.Assert` would be compiled out of what ships,
+and an off-UI-thread `Advance` is an unrecoverable data race, not a continue-able one);
+any future async continuation that touches a
 mirror, the registry, or calls `Advance` must resume on the UI `SynchronizationContext`
 — never `ConfigureAwait(false)`, never a raw thread-pool callback, even when guarding
 against an unrelated STA deadlock (the SMTC acquisition continuation is the case most

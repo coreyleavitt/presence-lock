@@ -232,7 +232,17 @@ let legalActions (t: EnvTruth) (deltas: int64 list) : EnvAction list =
 // Tick delta set: boundary-value style, derived from Cadence plus the model config (RFC
 // pinning: "for each modeled threshold, one delta landing just below it and one at or past it
 // -- so delta granularity and bucket boundaries agree by construction").
-// --------------------------------------------------------------------------------------------
+//
+// Deliberately NOT included: a boundary pair derived from `Cadence.WatchdogIntervalMs`. `Tick`
+// advances the model's core `step` time and fires a `Sample` at the deltas above (`applyTick`) --
+// it models the sample-timer cadence, never the shell's watchdog poll loop. The watchdog tick
+// (`WatchdogTickStep` in Program.cs: reconcile, then inhibitor `Refresh()`, then the sampling
+// watchdog step) isn't simulated at tick granularity here at all, and no modeled `EnvAction`
+// is gated on watchdog cadence: `ToggleMediaPlaying` (the action that feeds `LockInhibited`) is
+// a mirror action that calls the step under test with `Reconcile` synchronously on every toggle
+// (`applyMirrorChange`), exactly like `OsLock`/`OsUnlock`/`TogglePause` -- not something that
+// only takes effect on the next watchdog-cadence inhibitor refresh. So `WatchdogIntervalMs` has
+// no modeled threshold to derive a boundary pair against; this is a scope decision, not a gap.
 let tickDeltas (config: PolicyConfig) : int64 list =
     let boundary t = [ max 1L (t - 1L); t ]
     (int64 Cadence.DefaultSampleIntervalMs

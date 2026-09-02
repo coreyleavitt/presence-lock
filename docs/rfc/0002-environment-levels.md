@@ -1,6 +1,6 @@
 # RFC: Environment levels and lock inhibitors
 
-Status: Implemented (all 6 slices landed 2026-08-31; 1.1.0.0 installed and live-smoked same day; stage-4 code review pending, to run over this scope together with 0001-core-brain.md's)
+Status: Implemented; stage-4 review to floor (2 rounds, 2026-09-01) — 7-lens review over this scope and 0001-core-brain.md's shared core/shell; 1 Critical + 2 High + 4 Med fixed, floor = 0 Critical/High/Medium, core 91/91 + shell 143/143 green. Residual same-user-threat-model hardening tracked as follow-ups in the handoff. (all 6 slices landed 2026-08-31; 1.1.0.0 installed and live-smoked same day)
 Depends on: 0001 (supersedes its session/pause event contract; its decision-state,
 signal-health, and recovery contracts are unchanged and remain authoritative).
 
@@ -248,9 +248,16 @@ Instead, inhibition is an **orthogonal projection**, cached alongside status:
 val lockInhibited : State -> bool
 ```
 
-The projection's consumers are the verification harness (property 13 asserts it agrees
-with `inputs.LockInhibited` — real regression coverage for the `LastInputs` invariant)
-and diagnostic logging. The *render path* deliberately does not round-trip through it:
+The projection's sole consumer is the verification harness: property 13 asserts it agrees
+with `inputs.LockInhibited` — real regression coverage for the `LastInputs` invariant.
+There is deliberately **no product-code consumer**. Product-side inhibition diagnostics —
+the watchdog-tick transition log ("lock inhibitors active/cleared") and the `StatusText`
+annotation — are sourced from the inhibitor registry's own cached snapshot, not from this
+core echo (see the render-path note below). (An earlier draft also listed "diagnostic
+logging" as a consumer of the projection; that role is filled by the registry-sourced
+logging instead, so the projection earns its keep purely through the property-13 invariant
+check, not through any product read.) The *render path* deliberately does not round-trip
+through it:
 the shell's `StatusText` reads the inhibitor registry's own cached snapshot directly for
 **both** halves of the annotation — the active bool and the provider names — so one
 annotation has one owner instead of sourcing its bool from a core echo of a value the
@@ -649,9 +656,14 @@ Checks:
    property 14's note at every suppressed→unsuppressed transition, and printing the
    full action trace on any violation. The abstraction and the delta set are pinned,
    not improvised mid-slice (round 3): the dedup key is (`Armed`, grace bucket, away
-   bucket, bad-signal bucket `option`, input-idle bucket) × the env-truth tuple ×
+   bucket, bad-signal bucket, input-idle bucket) × the env-truth tuple ×
    `'aux`, each clock bucketed against its single governing threshold (`GraceMs`,
-   `AwayThresholdMs`, `NoSignalReportAfterMs`, `InputIdleRequiredMs`); `Tick`'s delta
+   `AwayThresholdMs`, `NoSignalReportAfterMs`, `InputIdleRequiredMs`). The bad-signal
+   bucket is a plain `ClockBucket`, not a `ClockBucket option`: `BadSignalSince = None`
+   and `Some now` are observationally identical through the opaque `State` (both bucket to
+   `Zero` and drive `dispatch` the same way), so the `None`/`Some` distinction adds no
+   node identity and collapsing it keeps the key a flat record without shrinking the graph.
+   `Tick`'s delta
    set is derived boundary-value style from `Cadence` plus the model config — for each
    modeled threshold, one delta landing just below it and one at or past it — so delta
    granularity and bucket boundaries agree by construction (too-coarse deltas would
@@ -847,3 +859,39 @@ cadence — accepted, and now the *only* accepted cost here.
    direction within the pinned three-interval bound); fast-user-switch behavior
    recorded against 0001-core-brain.md's known-limitation note; tray Exit → relaunch
    does not inherit a pause.
+
+## Follow-ups (stage-4 review, 2026-09-01)
+
+The stage-4 review reached the floor (0 Critical/High/Medium; see the handoff ledger for
+the full per-finding record). These remain as real, deferred work:
+
+- **Defeat-resistance for the SEC-1/SEC-4/SEC-2 same-user residuals → re-homed to
+  0003-defeat-resistance-layering.md** (2026-09-01). The short version: an app-level
+  self-protection service is the *wrong* answer (same-user code is already inside the boundary
+  the screen lock defends), so real defeat-resistance belongs in an OS-enforced inactivity
+  lock, and the only legitimate app-side remnant is a restart-only *reliability* watchdog that
+  keeps failures visible. Full rationale, layering, and open questions live in RFC-0003.
+- **Status annotation when config makes locking effectively unreachable.** The SEC-3 fix
+  added upper-bound ceilings so an absurd `AwayThresholdSeconds` is rejected outright; a
+  belt-and-suspenders annotation (surfacing "config out of range → defaults in use", the way
+  the SMTC path annotates inhibition) was deferred.
+- **SMTC false-positive hardening** (already an accepted known-limitation): muted/background
+  autoplay, and a same-user process registering a phantom `Playing` session, both inhibit the
+  lock. Kill switch + always-visible annotation are the v1 mitigations; a volume/attention-aware
+  refinement (WASAPI) remains future work.
+- **Doc/polish batch** (deferred Lows) — ✅ landed 2026-09-01 (2nd fix pass, suite green
+  core 92/92 + shell 149/149): `starvationMs` extracted to
+  `PolicyBridge.SamplingStarvationThresholdMs` + tests (DES-4); `NowMonotonic()` helper
+  removes the 7-site boilerplate (DES-5); `Policy.lockInhibited` RFC prose corrected to
+  harness-only, product diagnostics sourced from the registry snapshot (LIVE-1); explorer
+  `BadSignalBucket` prose reconciled to `ClockBucket` with the None/Some(0)-equivalence
+  rationale (RFC-1); the harness-Tick watchdog-cadence exclusion documented at `tickDeltas`
+  (TEST-2); `Policy.start` `LockInhibited` verbatim-init pinned via the projection, and
+  `InputIdleMs` found write-only-in-`LastInputs` so documented rather than tested (TEST-3);
+  0001-core-brain.md restart-streak prose tightened (CORE-2). `OnSessionSwitch`'s redundant
+  `Advance(Reconcile)` gated on `changed` and adversarially verified sound (SHELL-1).
+  Remaining, deliberately kept: DES-2b (one throwaway alloc/startup — removing it forces a
+  CS8602 on the watchdog closure's flow-state; not worth it).
+- **Non-hermetic test** (observed, pre-existing): `RestartStampsPersistenceTests` writes/deletes
+  a real file under `%LOCALAPPDATA%`, which flaked once in the Windows container with
+  `UnauthorizedAccessException`; it should be sandboxed to a temp dir.

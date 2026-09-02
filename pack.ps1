@@ -75,7 +75,16 @@ Invoke-LinuxPodman @('run','--rm',
 
 # 6. Sign on the host — the key stays in exactly one trust domain
 $signtool = (Get-ChildItem "$PSScriptRoot\tools\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
-$pw = (Get-Content "$PSScriptRoot\cert\pfx-password.txt" -Raw).Trim()
+# PFX password precedence: $env:PRESENCELOCK_PFX_PASSWORD, if set, wins over the
+# on-disk fallback. This lets a host operator export the password for the
+# session instead of leaving it at rest in cert\pfx-password.txt. Either way
+# the value lives only under cert\, which is git-ignored (never reaches source
+# control) and used solely by this host-only signing step.
+if ($env:PRESENCELOCK_PFX_PASSWORD) {
+    $pw = $env:PRESENCELOCK_PFX_PASSWORD
+} else {
+    $pw = (Get-Content "$PSScriptRoot\cert\pfx-password.txt" -Raw).Trim()
+}
 & $signtool sign /fd SHA256 /f "$PSScriptRoot\cert\PresenceLock.pfx" /p $pw "$PSScriptRoot\out\PresenceLock.msix"
 if ($LASTEXITCODE) { throw 'signtool failed' }
 

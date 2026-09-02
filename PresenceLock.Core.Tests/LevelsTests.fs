@@ -1,7 +1,10 @@
 module PresenceLock.Core.Tests.LevelsTests
 
 open Xunit
+open FsCheck
+open FsCheck.Xunit
 open PresenceLock.Core
+open PresenceLock.Core.Tests.Generators
 
 /// RFC 0002-environment-levels: tests for the `StepInputs`/`StepContext` contract, exercised
 /// via `Policy.start`/`Policy.step`. Helpers mirror Tests.fs's `noStamps`/`someConfig`
@@ -117,6 +120,31 @@ let ``start with unsuppressed inputs then an unsuppressed call fires no baseline
     Assert.False(snap.InGrace)
     Assert.Equal(farNow, snap.AwayForMs)
 
+// --- start's LastInputs verbatim carry, the remaining two fields (RFC "Policy.start
+// initializes LastInputs to those same initial inputs verbatim ... for all four fields"): the
+// two edge tests just above exercise SessionLocked/Paused (the two fields `suppressed` reads)
+// via the suppression edge. LockInhibited and InputIdleMs need their own coverage. -----------
+
+[<Fact>]
+let ``start carries LockInhibited verbatim into LastInputs, observable directly via the lockInhibited projection`` () =
+    let inhibitedAtStart = { unsuppressedInputs with LockInhibited = true }
+    let inhibitedState = Policy.start (MonotonicMs 0L, noStamps, inhibitedAtStart)
+    Assert.True(Policy.lockInhibited inhibitedState)
+    let uninhibitedState = Policy.start (MonotonicMs 0L, noStamps, unsuppressedInputs)
+    Assert.False(Policy.lockInhibited uninhibitedState)
+
+// InputIdleMs's verbatim carry at `start` is NOT independently observable -- not just before
+// the first Sample, but ever. `dispatch`'s `NoFace` arm is the only place `InputIdleMs` is
+// read for a decision (`idleSatisfied`), and it reads `ctx.Inputs.InputIdleMs` -- the CURRENT
+// call's freshly sampled idle value -- never `state.LastInputs.InputIdleMs`. Of `LastInputs`'s
+// four fields, only `SessionLocked`/`Paused` (via `suppressed`) and `LockInhibited` (via the
+// `lockInhibited` projection, pinned above) ever feed a decision or a public projection;
+// `InputIdleMs` is written into `LastInputs` on every `step`/`start` call but is otherwise
+// write-only from that point on -- there is no `Policy.inputIdleMs` projection and no dispatch
+// arm ever reads it back off `state`. So there is no observable, at `start` or afterward,
+// through which a verbatim-vs-defaulted initial `InputIdleMs` could ever diverge; per the
+// finding's own escape hatch, that is documented here rather than pinned with a contrived test.
+
 // --- While-suppressed Sample: decision-state/Action no-op, but LastInputs/CachedStatus
 // still update (RFC: "'No-op' refers to decision state ... never to LastInputs/CachedStatus")
 
@@ -202,6 +230,121 @@ let ``identical consecutive StepInputs across a Reconcile trigger no edge and no
     let secondSnap = Policy.snapshot (someConfig, secondReconcile.State, MonotonicMs 2000L)
     Assert.True(secondSnap.Armed)
     Assert.Equal(1999L, secondSnap.AwayForMs)
+
+// --- Level idempotence, generalized: the RFC pins this as a PROPERTY, not a single
+// hand-picked scenario -- an identical-input no-op `step` call must leave EVERY decision-
+// state field unchanged, not merely the two the fact above happens to probe (Armed/
+// AwayForMs). Scoped to `Event.Reconcile` specifically (Reconcile carries no observation),
+// so this stays compatible with Tests.fs property 9 (a `Sample` may legitimately re-derive
+// Lock on repetition) -- this property only ever drives the SECOND, repeated call via
+// Reconcile, never via Sample. `State`'s representation is `internal` (Types.fs) and this
+// file has no `InternalsVisibleTo` grant, so every field below is checked the only way a
+// real caller could: through `Policy.snapshot`/`status`/`lockInhibited`'s public projections
+// -- which happen to cover exactly the RFC's named decision-state fields (Armed, grace/away
+// baselines via GraceForMs/AwayForMs, BadSignalSince via NoSignalForMs, InitFailStreak, and
+// every `RestartStamps` field via the three `Last*RestartAt` snapshot fields). -------------
+
+/// Local to this file, not `Generators.fs` (no `StepInputs` arbitrary is registered there,
+/// and this property is the only consumer). `InputIdleMs` is bounded like
+/// `Generators.policyConfigGen`'s own idle-adjacent draw (0, 3_600_000) rather than FsCheck's
+/// full `int64` range, so generated calls explore comparably against
+/// `PolicyConfig.InputIdleRequiredMs`'s (1, 60_000) draw instead of drowning it in
+/// astronomically large idle values that can never realistically cross a threshold.
+let private stepInputsGen : Gen<StepInputs> =
+    gen {
+        let! sessionLocked = Arb.generate<bool>
+        let! paused = Arb.generate<bool>
+        let! lockInhibited = Arb.generate<bool>
+        let! inputIdleMs = Gen.choose (0, 3_600_000) |> Gen.map int64
+        return
+            { SessionLocked = sessionLocked
+              Paused = paused
+              LockInhibited = lockInhibited
+              InputIdleMs = inputIdleMs }
+    }
+
+/// One prior "setup" tick, reaching an arbitrary reachable decision state before the two-call
+/// no-op pair under test: `deltaMs` of monotonic time elapses, then `step` runs against an
+/// arbitrary sampled `StepInputs` and the full generic event alphabet (`Generators.eventGen`,
+/// reused rather than redefined -- the same alphabet Tests.fs's properties 9/12 walk over).
+let private setupTicksGen : Gen<(int64 * StepInputs * Event) list> =
+    Gen.listOf (
+        gen {
+            let! deltaMs = Gen.choose (0, 20_000) |> Gen.map int64
+            let! inputs = stepInputsGen
+            let! event = eventGen
+            return (deltaMs, inputs, event)
+        }
+    )
+
+/// The two-call pair under test, plus the arbitrary warm-up walk that precedes it. `FirstEvent`
+/// ranges over the full alphabet (any event may legitimately produce the "post-first-call
+/// state" the redundant Reconcile must then leave untouched); the second call is always
+/// `Event.Reconcile`, carrying `FirstInputs` again bitwise-unchanged.
+type private NoopReconcileScenario =
+    { Setup: (int64 * StepInputs * Event) list
+      FirstDeltaMs: int64
+      FirstInputs: StepInputs
+      FirstEvent: Event
+      SecondDeltaMs: int64 }
+
+let private noopReconcileScenarioGen : Gen<NoopReconcileScenario> =
+    gen {
+        let! setup = setupTicksGen
+        let! firstDeltaMs = Gen.choose (0, 20_000) |> Gen.map int64
+        let! firstInputs = stepInputsGen
+        let! firstEvent = eventGen
+        let! secondDeltaMs = Gen.choose (0, 20_000) |> Gen.map int64
+        return
+            { Setup = setup
+              FirstDeltaMs = firstDeltaMs
+              FirstInputs = firstInputs
+              FirstEvent = firstEvent
+              SecondDeltaMs = secondDeltaMs }
+    }
+
+[<Properties(Arbitrary = [| typeof<Generators> |])>]
+module PropertyTests =
+
+    [<Property>]
+    let ``identical consecutive StepInputs across a Reconcile leave every publicly observable decision-state field unchanged from the post-first-call state``
+        (config: PolicyConfig)
+        (stamps: RestartStamps)
+        (startAt: MonotonicMs)
+        =
+        let (MonotonicMs startMs) = startAt
+        Prop.forAll (Arb.fromGen noopReconcileScenarioGen) (fun scenario ->
+            let initialState = Policy.start (MonotonicMs startMs, stamps, unsuppressedInputs)
+            let folder (state, nowMs) (deltaMs, inputs, event) =
+                let nowMs' = nowMs + deltaMs
+                let result = Policy.step (config, state, ctx nowMs' inputs, event)
+                (result.State, nowMs')
+            let warmedState, warmedNowMs = List.fold folder (initialState, startMs) scenario.Setup
+            // The first call of the pair -- establishes the post-first-call state the
+            // redundant Reconcile below must leave untouched.
+            let firstNowMs = warmedNowMs + scenario.FirstDeltaMs
+            let firstResult =
+                Policy.step (config, warmedState, ctx firstNowMs scenario.FirstInputs, scenario.FirstEvent)
+            // The second call: StepInputs bitwise-identical to the first's (`scenario.FirstInputs`
+            // again, not re-generated), driven by Event.Reconcile.
+            let secondNowMs = firstNowMs + scenario.SecondDeltaMs
+            let secondResult =
+                Policy.step (config, firstResult.State, ctx secondNowMs scenario.FirstInputs, Event.Reconcile)
+            // Querying the world at the SAME instant (secondNowMs) must read identically whether
+            // or not the redundant Reconcile fired -- isolates "did anything mutate" from
+            // ordinary clock progression, without needing access to `State`'s internal fields.
+            //
+            // `Policy.status` is deliberately NOT compared here: `CachedStatus` is a snapshot
+            // of status AS OF the call that produced it, and Reconcile's entire purpose is to
+            // re-derive status from elapsed time against unchanged baselines (Generators.fs:
+            // "the mostly no-op, but re-derives status noise case") -- e.g. Watching -> NoSignal
+            // as NoSignalForMs crosses the threshold between `firstNowMs` and `secondNowMs` is
+            // correct, expected behavior, not a decision-state mutation. `lockInhibited` is
+            // likewise not compared: it is a pure projection of `LastInputs.LockInhibited`,
+            // trivially equal here since both calls carry the same `scenario.FirstInputs`.
+            let asIfNoRedundantCallHadHappened = Policy.snapshot (config, firstResult.State, MonotonicMs secondNowMs)
+            let afterRedundantCall = Policy.snapshot (config, secondResult.State, MonotonicMs secondNowMs)
+            asIfNoRedundantCallHadHappened = afterRedundantCall)
 
 // --- lockInhibited projection agrees with the inputs last passed (RFC "Status": the
 // projection's consumers rely on it tracking LastInputs.LockInhibited exactly) ------------

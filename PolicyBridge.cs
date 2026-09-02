@@ -59,10 +59,36 @@ static class PolicyBridge
         // construction, the same way the other eight fields are validated as a unit.
         long awayFloorMs = Core.FilterConfig.Default.MinCoherentMs + 2 * cfg.SampleIntervalMs;
 
+        // Upper bounds (SEC-3): before this, only lower bounds were checked, so an absurdly
+        // large value -- a bad hand-edit, a corrupted file, or same-user tampering (this app
+        // cannot defend against a same-user writer; see CLAUDE.md's threat model) -- passed
+        // validation and silently made locking effectively unreachable while Status kept
+        // reading plain "Watching," with no cue anything was wrong (unlike the SMTC inhibitor
+        // path, which does annotate). Mirrors SanitizeSensingConfig's existing discipline of
+        // giving every field a real ceiling, not just a floor. The away/grace/idle-class fields
+        // gate the lock decision itself, so their ceiling is a few hours -- locking on a
+        // multi-hour timescale is not a meaningful "auto-lock while away" configuration under
+        // any legitimate use, but the ceiling stays generous rather than opinionated about what
+        // "a few hours" should be. Cooldown-class fields gate retry/re-evaluation cadence, not
+        // the lock decision, so they get a longer, day-scale ceiling. RecoveryFailureThreshold
+        // is a small integer retry count; a three-digit ceiling is already far past any
+        // legitimate value while still bounding it against, e.g., an accidental extra zero.
+        const long PolicyFieldCeilingMs = 4 * 3600_000L;      // 4 hours
+        const long CooldownCeilingMs = 24 * 3600_000L;        // 24 hours
+        const int RecoveryFailureThresholdCeiling = 100;
+
         bool valid =
             awayMs > 0 && idleMs > 0 && graceMs > 0 &&
             noSignalMs > 0 && reevaluateAfterMs > 0 && reevaluateCooldownMs > 0 &&
             recoveryCooldownMs > 0 && recoveryThreshold >= 1 && upgradeCooldownMs > 0 &&
+            awayMs <= PolicyFieldCeilingMs && idleMs <= PolicyFieldCeilingMs && graceMs <= PolicyFieldCeilingMs &&
+            noSignalMs <= PolicyFieldCeilingMs && reevaluateAfterMs <= PolicyFieldCeilingMs &&
+            reevaluateCooldownMs <= CooldownCeilingMs && recoveryCooldownMs <= CooldownCeilingMs &&
+            upgradeCooldownMs <= CooldownCeilingMs && recoveryThreshold <= RecoveryFailureThresholdCeiling &&
+            // noSignalMs's ceiling is also implied transitively (reevaluateAfterMs >= noSignalMs, below,
+            // and reevaluateAfterMs <= PolicyFieldCeilingMs, above), so it can never be the *sole*
+            // reason validation fails. It is kept explicit as defense-in-depth: were the coupling ever
+            // relaxed, noSignalMs would still carry its own bound rather than silently losing it.
             reevaluateAfterMs >= noSignalMs && awayMs >= awayFloorMs;
 
         if (!valid)
@@ -343,6 +369,25 @@ static class PolicyBridge
     /// capture-failure handling gates the resulting restart on `RecoveryCooldownMs`, so repeated
     /// watchdog fires while truly stuck converge to one restart per cooldown window, never a
     /// storm. This introduces no new restart authority; it only feeds the one that already exists.
+    /// The sampling watchdog's starvation threshold (incident 2026-08-12), fed into
+    /// `SamplingWatchdogStep`'s `starvationMs` parameter every watchdog tick: a completed sample
+    /// pass is overdue once `nowMs - lastSamplePassMs` reaches this many milliseconds. Ten missed
+    /// sample intervals, not one or two -- a single slow pass (a momentarily busy FrameServer, a
+    /// slow `DetectFacesAsync` call) must not trip the watchdog; only a pipeline that has gone
+    /// quiet for an order of magnitude longer than its own configured cadence counts as starved.
+    /// The 15-second floor keeps that 10x multiplier from getting pathologically twitchy at a
+    /// fast configured `SampleIntervalMs` -- at the sanitized minimum of 100ms
+    /// (`SanitizeSensingConfig`'s own floor), 10x alone would be a 1-second threshold, well
+    /// inside ordinary scheduling jitter and camera-pipeline latency, which would false-positive
+    /// the watchdog on perfectly healthy sampling. 15s is comfortably longer than every other
+    /// timing constant in this codebase that isn't itself policy-configurable (the constructor's
+    /// `retryTimer` cadence is 5s), so it holds as an absolute floor regardless of how fast
+    /// sampling is configured. Whichever of the two terms is larger wins, so neither a very fast
+    /// nor a very slow configured sample interval can push the threshold below a sane minimum or
+    /// make it needlessly slow to notice a genuinely wedged pipeline.
+    internal static long SamplingStarvationThresholdMs(int sampleIntervalMs) =>
+        Math.Max(10L * sampleIntervalMs, 15000L);
+
     internal static WatchdogVerdict SamplingWatchdogStep(
         bool expectsSampling, long nowMs, long lastSamplePassMs, int strikes, long starvationMs)
     {
@@ -600,6 +645,22 @@ static class PolicyBridge
         }
     }
 
+    /// SEC-4 (reframed): the persisted pause flag survives a deliberate self-restart by design
+    /// (RFC 0002-environment-levels, "Pause ownership") -- but the stamps file backing it
+    /// (`StampsPath`) is an ordinary same-user readable/writable file, so a forged or corrupted
+    /// `Paused:true` entry would otherwise start the app paused with only the tray text as a
+    /// cue. Same-user tampering can't be prevented (this app's own threat model -- see
+    /// CLAUDE.md), so an inherited-pause startup gets exactly one loud WARNING line instead of
+    /// silence. Pure and named, mirroring `SuppressionTransitionVerdict.TransitionLogMessage`'s
+    /// null-means-no-log contract, so the trigger condition (and only the trigger condition) is
+    /// unit-tested independently of the WinForms constructor that calls it.
+    internal static string? StartupPauseInheritedWarning(bool startupPaused) =>
+        startupPaused
+            ? "WARNING: starting PAUSED from persisted restart-stamps state -- if this was not " +
+              "expected (no deliberate Pause before the last self-restart), the stamps file may " +
+              "have been tampered with or corrupted"
+            : null;
+
     sealed class RestartStampsDto
     {
         public long? WedgeAt { get; init; }
@@ -610,6 +671,97 @@ static class PolicyBridge
         public long? UpgradeAt { get; init; }
         public bool Paused { get; init; }
     }
+}
+
+/// The session-lock mirror (RFC 0002-environment-levels, "Session mirror with reconciliation",
+/// DES-2): owns the three fields that used to be loose `WatcherContext` state --
+/// `sessionLocked`/`ticksSinceLastSessionSwitchMirrorChange`/`sessionLockDisagreementCount` --
+/// behind the two call sites that ever mutate them after construction (`OnSessionSwitch`'s live
+/// SessionLock/SessionUnlock delivery, and the watchdog tick's WTS reconciliation), mirroring
+/// `LockInhibitorRegistry`'s precedent one slice later: "these fields change together, only from
+/// these places" stops being a convention documented in prose and becomes a structural fact once
+/// one type is the only thing that can write them. Delegates every actual decision to the
+/// existing pure `PolicyBridge.SessionSwitchTicksAfterDelivery`/`PolicyBridge.ReconciliationStep`
+/// unchanged -- this type is field ownership, not new policy, so its externally observable
+/// behavior is exactly the pre-extraction inline code, byte-for-byte. `Locked` is read fresh by
+/// `BuildStepInputs`/`Advance` at any cadence, exactly like the old bare field; mutated only from
+/// the UI thread, by the same two call sites (`OnSessionSwitch`'s `ui.Post` continuation and the
+/// watchdog `Tick` handler) that already carried the threading invariant `Advance` asserts (DES-1)
+/// -- this type adds no locking of its own because it needs none under that discipline.
+internal sealed class SessionLockMirror
+{
+    // Ticks since the last SessionSwitch-driven update that actually CHANGED `Locked` (round-3
+    // boundary rule 2's skip window; see `PolicyBridge.SessionSwitchTicksAfterDelivery`). Starts
+    // at 1 (not 0): at process start no SessionSwitch has fired at all, so the very first
+    // watchdog tick must not be treated as "adjacent to a session switch."
+    int ticksSinceLastSessionSwitchMirrorChange = 1;
+    // Consecutive watchdog ticks the WTS query has disagreed with `Locked`
+    // (`PolicyBridge.ReconciliationStep`'s two-tick hysteresis counter; round-3 boundary rule 1
+    // holds this across a failed query rather than resetting it).
+    int disagreementCount;
+
+    public bool Locked { get; private set; }
+
+    /// Seeds `Locked` from the constructor's synchronous startup WTS query
+    /// (`WatcherContext.AssembleStartupInputs`) -- fail-open, so a failed startup query leaves
+    /// this at its safe default, false, via the caller's own fail-open `WtsLockQueryResult`
+    /// handling; this constructor does not itself re-derive fail-open behavior.
+    public SessionLockMirror(bool initialLocked) => Locked = initialLocked;
+
+    /// The live `SessionLock`/`SessionUnlock` delivery path (`WatcherContext.OnSessionSwitch`):
+    /// sets `Locked` to the delivered value and advances the skip-window counter via
+    /// `SessionSwitchTicksAfterDelivery` -- reset to zero only when this delivery actually
+    /// changed the mirror, per that function's own contract (an idempotent duplicate
+    /// `SessionSwitch` re-delivery, which Windows demonstrably produces, must leave the counter
+    /// running). Returns whether this delivery actually changed `Locked`, mirroring
+    /// `LockInhibitorRegistry.Refresh`'s and `ReconcileResult.CorrectionApplied`'s own
+    /// changed-flag precedent (SHELL-1): the caller gates its log line and
+    /// `Advance(Core.Event.Reconcile)` on this return value, so a duplicate/idempotent
+    /// `SessionSwitch` delivery -- a genuine no-op for this mirror -- does no redundant work,
+    /// matching the other two mirror-changing call sites (WTS reconciliation gates on
+    /// `CorrectionApplied`; inhibitor aggregation gates on `Refresh()`'s own `changed`). A
+    /// delivery that DOES change `Locked` still always returns true, so the caller's
+    /// suppression-exit transition (filter reset, sample-timer restart, `KickAcquisitionIfNeeded`
+    /// -- all riding `Advance`'s internal transition rule) is never skipped for a genuine
+    /// transition, only for a true repeat.
+    public bool OnSessionSwitch(bool locked)
+    {
+        bool changed = Locked != locked;
+        Locked = locked;
+        ticksSinceLastSessionSwitchMirrorChange =
+            PolicyBridge.SessionSwitchTicksAfterDelivery(changed, ticksSinceLastSessionSwitchMirrorChange);
+        return changed;
+    }
+
+    /// One watchdog-tick WTS reconciliation evaluation: delegates the decision to
+    /// `PolicyBridge.ReconciliationStep` unchanged, over this instance's own `Locked` and
+    /// counters, then applies the verdict -- correcting `Locked` only when `CorrectionApplied`.
+    /// The skip-window tick counter always advances exactly once per call, AFTER
+    /// `ReconciliationStep` has already read the pre-increment value -- matching the field
+    /// comment this replaces ("advanced here, once per tick, after this tick's own
+    /// reconciliation already read the pre-increment value"). Returns the old/new mirror values
+    /// so the caller's WARNING log line reads identically to before extraction; the caller
+    /// remains responsible for the log write itself and for `Advance(Core.Event.Reconcile)` on a
+    /// correction, for the same reason `OnSessionSwitch` leaves `Advance` to its caller.
+    public ReconcileResult Reconcile(bool querySucceeded, bool queriedLocked)
+    {
+        bool before = Locked;
+        var verdict = PolicyBridge.ReconciliationStep(
+            mirror: Locked,
+            queriedLocked: queriedLocked,
+            querySucceeded: querySucceeded,
+            ticksSinceLastSessionSwitchMirrorChange: ticksSinceLastSessionSwitchMirrorChange,
+            consecutiveDisagreementCount: disagreementCount);
+        disagreementCount = verdict.DisagreementCount;
+        if (verdict.CorrectionApplied) Locked = verdict.Mirror;
+        ticksSinceLastSessionSwitchMirrorChange++;
+        return new ReconcileResult(verdict.CorrectionApplied, before, verdict.Mirror);
+    }
+
+    /// Verdict of one `Reconcile` call: `OldLocked`/`NewLocked` are only meaningful (and only
+    /// ever differ) when `CorrectionApplied` is true -- the caller's WARNING log line reads
+    /// `{OldLocked} -> {NewLocked}` exactly as the pre-extraction inline code did.
+    internal readonly record struct ReconcileResult(bool CorrectionApplied, bool OldLocked, bool NewLocked);
 }
 
 /// One named, cached lock-inhibitor level (RFC 0002-environment-levels, "Inhibitor registry"):

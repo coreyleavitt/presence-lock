@@ -259,6 +259,86 @@ public class BuildPolicyConfigTests
         Assert.Equal(1500, policy.AwayThresholdMs);
     }
 
+    /// SEC-3: before this, BuildPolicyConfig validated lower bounds only -- an absurdly large
+    /// away/grace/idle threshold or cooldown passed validation and silently made locking
+    /// effectively unreachable while Status kept reading plain "Watching," with no annotation
+    /// (unlike the SMTC inhibitor path). Each row below sends exactly one field over its new
+    /// ceiling (see BuildPolicyConfig's ceiling comment) and asserts the existing all-or-nothing
+    /// fallback contract still applies -- same mechanism SEC-3 extends, not a new one.
+    [Theory]
+    [InlineData(14401.0, 10.0, 10.0, 10000L, 20000L, 600000L, 3, 600000L, 600000L)]          // AwayThresholdSeconds over the 4h ceiling
+    [InlineData(5.0, 14401.0, 10.0, 10000L, 20000L, 600000L, 3, 600000L, 600000L)]           // InputIdleSeconds over the 4h ceiling
+    [InlineData(5.0, 10.0, 14401.0, 10000L, 20000L, 600000L, 3, 600000L, 600000L)]           // GraceSeconds over the 4h ceiling
+    [InlineData(5.0, 10.0, 10.0, 14400001L, 20000000L, 600000L, 3, 600000L, 600000L)]        // NoSignalReportAfterMs over the 4h ceiling
+    [InlineData(5.0, 10.0, 10.0, 10000L, 14400001L, 600000L, 3, 600000L, 600000L)]           // ReevaluateAfterMs over the 4h ceiling
+    [InlineData(5.0, 10.0, 10.0, 10000L, 20000L, 86400001L, 3, 600000L, 600000L)]            // ReevaluateCooldownMs over the 24h ceiling
+    [InlineData(5.0, 10.0, 10.0, 10000L, 20000L, 600000L, 101, 600000L, 600000L)]            // RecoveryFailureThreshold over the ceiling of 100
+    [InlineData(5.0, 10.0, 10.0, 10000L, 20000L, 600000L, 3, 86400001L, 600000L)]            // RecoveryCooldownMs over the 24h ceiling
+    [InlineData(5.0, 10.0, 10.0, 10000L, 20000L, 600000L, 3, 600000L, 86400001L)]            // UpgradeCooldownMs over the 24h ceiling
+    public void A_field_over_its_upper_bound_falls_back_to_the_full_default_set(
+        double awaySeconds, double idleSeconds, double graceSeconds,
+        long noSignalMs, long reevaluateAfterMs, long reevaluateCooldownMs,
+        int recoveryThreshold, long recoveryCooldownMs, long upgradeCooldownMs)
+    {
+        var cfg = new Config
+        {
+            AwayThresholdSeconds = awaySeconds,
+            InputIdleSeconds = idleSeconds,
+            GraceSeconds = graceSeconds,
+            NoSignalReportAfterMs = noSignalMs,
+            ReevaluateAfterMs = reevaluateAfterMs,
+            ReevaluateCooldownMs = reevaluateCooldownMs,
+            RecoveryFailureThreshold = recoveryThreshold,
+            RecoveryCooldownMs = recoveryCooldownMs,
+            UpgradeCooldownMs = upgradeCooldownMs,
+        };
+
+        var policy = PolicyBridge.BuildPolicyConfig(cfg);
+        var expectedDefaults = PolicyBridge.BuildPolicyConfig(new Config());
+
+        Assert.Equal(expectedDefaults.AwayThresholdMs, policy.AwayThresholdMs);
+        Assert.Equal(expectedDefaults.RecoveryCooldownMs, policy.RecoveryCooldownMs);
+        Assert.Equal(expectedDefaults.UpgradeCooldownMs, policy.UpgradeCooldownMs);
+    }
+
+    /// Boundary values sitting exactly AT each new ceiling must pass through untouched -- the
+    /// ceiling is inclusive, matching SanitizeSensingConfig's existing [100, 10000]/[0, 255]
+    /// inclusive-range precedent (`Boundary_values_at_the_edges_of_the_valid_range_pass_through_untouched`).
+    [Fact]
+    public void Boundary_values_exactly_at_each_new_ceiling_pass_through_untouched()
+    {
+        var away = PolicyBridge.BuildPolicyConfig(new Config { AwayThresholdSeconds = 14400.0 });
+        Assert.Equal(14_400_000L, away.AwayThresholdMs);
+
+        var idle = PolicyBridge.BuildPolicyConfig(new Config { InputIdleSeconds = 14400.0 });
+        Assert.Equal(14_400_000L, idle.InputIdleRequiredMs);
+
+        var grace = PolicyBridge.BuildPolicyConfig(new Config { GraceSeconds = 14400.0 });
+        Assert.Equal(14_400_000L, grace.GraceMs);
+
+        // NoSignalReportAfterMs's ceiling coincides with ReevaluateAfterMs's own ceiling, and
+        // ReevaluateAfterMs must be >= NoSignalReportAfterMs -- both sit at the shared ceiling.
+        var noSignal = PolicyBridge.BuildPolicyConfig(new Config
+        {
+            NoSignalReportAfterMs = 14_400_000L,
+            ReevaluateAfterMs = 14_400_000L,
+        });
+        Assert.Equal(14_400_000L, noSignal.NoSignalReportAfterMs);
+        Assert.Equal(14_400_000L, noSignal.ReevaluateAfterMs);
+
+        var reevaluateCooldown = PolicyBridge.BuildPolicyConfig(new Config { ReevaluateCooldownMs = 86_400_000L });
+        Assert.Equal(86_400_000L, reevaluateCooldown.ReevaluateCooldownMs);
+
+        var recoveryThreshold = PolicyBridge.BuildPolicyConfig(new Config { RecoveryFailureThreshold = 100 });
+        Assert.Equal(100, recoveryThreshold.RecoveryFailureThreshold);
+
+        var recoveryCooldown = PolicyBridge.BuildPolicyConfig(new Config { RecoveryCooldownMs = 86_400_000L });
+        Assert.Equal(86_400_000L, recoveryCooldown.RecoveryCooldownMs);
+
+        var upgradeCooldown = PolicyBridge.BuildPolicyConfig(new Config { UpgradeCooldownMs = 86_400_000L });
+        Assert.Equal(86_400_000L, upgradeCooldown.UpgradeCooldownMs);
+    }
+
     [Fact]
     public void Sensing_only_fields_are_not_part_of_PolicyConfig_and_do_not_affect_the_fallback()
     {
@@ -633,6 +713,42 @@ public class SamplingWatchdogStepTests
             expectsSampling: true, nowMs: 40_000, lastSamplePassMs: first.StampMs, strikes: first.Strikes, starvationMs: StarvationMs);
         Assert.True(second.TreatAsCaptureFailed);
         Assert.Equal(0, second.Strikes);
+    }
+}
+
+/// The sampling watchdog's starvation-threshold computation (incident 2026-08-12, DES-4):
+/// extracted out of the watchdog-tick lambda's inline `Math.Max(10L * cfg.SampleIntervalMs,
+/// 15000)` specifically so the two magic numbers (the 10x multiplier, the 15000ms floor) get
+/// the same independent, dedicated unit coverage as `SamplingWatchdogStep` itself rather than
+/// living untested inside a lambda.
+public class SamplingStarvationThresholdMsTests
+{
+    [Fact]
+    public void The_15_second_floor_dominates_at_a_small_sample_interval()
+    {
+        // 10 * 100ms = 1000ms, well under the 15s floor.
+        Assert.Equal(15000L, PolicyBridge.SamplingStarvationThresholdMs(100));
+    }
+
+    [Fact]
+    public void The_10x_term_dominates_at_a_large_sample_interval()
+    {
+        // 10 * 5000ms = 50000ms, well over the 15s floor.
+        Assert.Equal(50000L, PolicyBridge.SamplingStarvationThresholdMs(5000));
+    }
+
+    [Fact]
+    public void The_crossover_boundary_is_exactly_1500ms_where_both_terms_agree()
+    {
+        // 10 * 1500 == 15000 == the floor -- both formulas agree exactly at this interval.
+        Assert.Equal(15000L, PolicyBridge.SamplingStarvationThresholdMs(1500));
+
+        // Just below the crossover: the 10x term (14990) is still under the floor, so the
+        // floor wins.
+        Assert.Equal(15000L, PolicyBridge.SamplingStarvationThresholdMs(1499));
+
+        // Just above the crossover: the 10x term (15010) has overtaken the floor.
+        Assert.Equal(15010L, PolicyBridge.SamplingStarvationThresholdMs(1501));
     }
 }
 
@@ -1142,6 +1258,178 @@ public class ReconciliationStepTests
             ticksSinceLastSessionSwitchMirrorChange: 2, consecutiveDisagreementCount: tick2.DisagreementCount);
         Assert.True(tick3.CorrectionApplied); // corrected on the third watchdog tick, not before
         Assert.True(tick3.Mirror);
+    }
+}
+
+/// DES-2: `SessionLockMirror` owns the three fields that used to be loose `WatcherContext` state
+/// (`sessionLocked`/`ticksSinceLastSessionSwitchMirrorChange`/`sessionLockDisagreementCount`)
+/// behind `OnSessionSwitch`/`Reconcile`, delegating the actual decision to the existing
+/// `SessionSwitchTicksAfterDelivery`/`ReconciliationStep` unchanged -- this type is field
+/// ownership, not new policy. These tests pin that the delegation and field bookkeeping are
+/// wired correctly (in particular, that the skip-window reset/hold behavior these two methods
+/// share via the same private counter survives the extraction) rather than re-testing the pure
+/// functions themselves, which are already covered by `ReconciliationStepTests`/
+/// `SessionSwitchTicksAfterDeliveryTests` above.
+public class SessionLockMirrorTests
+{
+    [Fact]
+    public void Constructed_with_the_startup_value_exposes_it_as_Locked()
+    {
+        Assert.True(new SessionLockMirror(initialLocked: true).Locked);
+        Assert.False(new SessionLockMirror(initialLocked: false).Locked);
+    }
+
+    [Fact]
+    public void OnSessionSwitch_sets_Locked_to_the_delivered_value_in_either_direction()
+    {
+        var mirror = new SessionLockMirror(initialLocked: false);
+
+        mirror.OnSessionSwitch(locked: true);
+        Assert.True(mirror.Locked);
+
+        mirror.OnSessionSwitch(locked: false);
+        Assert.False(mirror.Locked);
+    }
+
+    [Fact]
+    public void A_genuine_change_from_OnSessionSwitch_resets_the_skip_window_so_correction_needs_a_third_tick()
+    {
+        // Mirrors ReconciliationStepTests' compounding skip-plus-hysteresis case, but through
+        // SessionLockMirror's own OnSessionSwitch/Reconcile surface: a genuine mirror-changing
+        // SessionSwitch must reset the skip window to zero, so the very next Reconcile call is
+        // skipped entirely. Proof: correction needs a THIRD disagreeing Reconcile call here, not
+        // a second -- a stuck/un-reset skip window would correct on the second call instead.
+        var mirror = new SessionLockMirror(initialLocked: false);
+        mirror.OnSessionSwitch(locked: true); // genuine change: Locked -> true, skip window -> 0
+
+        var tick1 = mirror.Reconcile(querySucceeded: true, queriedLocked: false); // skipped (window == 0)
+        Assert.False(tick1.CorrectionApplied);
+        var tick2 = mirror.Reconcile(querySucceeded: true, queriedLocked: false); // first real disagreement
+        Assert.False(tick2.CorrectionApplied);
+        var tick3 = mirror.Reconcile(querySucceeded: true, queriedLocked: false); // second -> corrects
+        Assert.True(tick3.CorrectionApplied);
+        Assert.False(mirror.Locked);
+    }
+
+    [Fact]
+    public void An_idempotent_duplicate_SessionSwitch_does_not_restart_the_skip_window()
+    {
+        var mirror = new SessionLockMirror(initialLocked: true);
+        // Advance the skip window well past the constructor default via two agreeing (no-op)
+        // Reconcile calls, so the window is unambiguously open before the duplicate delivery.
+        mirror.Reconcile(querySucceeded: true, queriedLocked: true);
+        mirror.Reconcile(querySucceeded: true, queriedLocked: true);
+
+        mirror.OnSessionSwitch(locked: true); // duplicate delivery: no change, window must NOT reset
+
+        // If the window had been (wrongly) reset to zero, correction would need a third
+        // disagreeing tick (as in the genuine-change test above). Correcting on the SECOND
+        // disagreeing tick instead proves the duplicate left the window running.
+        var tick1 = mirror.Reconcile(querySucceeded: true, queriedLocked: false);
+        Assert.False(tick1.CorrectionApplied);
+        var tick2 = mirror.Reconcile(querySucceeded: true, queriedLocked: false);
+        Assert.True(tick2.CorrectionApplied);
+    }
+
+    [Fact]
+    public void Reconcile_applies_a_correction_on_the_second_consecutive_disagreeing_tick_and_reports_old_and_new_values()
+    {
+        var mirror = new SessionLockMirror(initialLocked: true);
+        mirror.Reconcile(querySucceeded: true, queriedLocked: true); // advance the skip window, no disagreement
+
+        var first = mirror.Reconcile(querySucceeded: true, queriedLocked: false);
+        Assert.False(first.CorrectionApplied);
+        Assert.True(mirror.Locked); // uncorrected yet -- hysteresis not met
+
+        var second = mirror.Reconcile(querySucceeded: true, queriedLocked: false);
+        Assert.True(second.CorrectionApplied);
+        Assert.True(second.OldLocked);
+        Assert.False(second.NewLocked);
+        Assert.False(mirror.Locked);
+    }
+
+    [Fact]
+    public void A_failed_query_never_corrects_the_mirror_even_when_the_streak_would_otherwise_be_ready()
+    {
+        var mirror = new SessionLockMirror(initialLocked: false);
+        mirror.Reconcile(querySucceeded: true, queriedLocked: false); // advance the skip window, agrees
+        mirror.Reconcile(querySucceeded: true, queriedLocked: true);  // first disagreeing tick
+
+        var result = mirror.Reconcile(querySucceeded: false, queriedLocked: true); // query fails on what would be the second
+
+        Assert.False(result.CorrectionApplied);
+        Assert.False(mirror.Locked);
+    }
+
+    /// SHELL-1: `OnSessionSwitch`'s return value is what `WatcherContext.OnSessionSwitch` gates
+    /// its log line and `Advance(Core.Event.Reconcile)` call on, so a duplicate/idempotent
+    /// SessionSwitch delivery (Windows demonstrably double-fires these) does no redundant work --
+    /// matching the other two mirror-changing sites (WTS reconciliation gates on
+    /// `CorrectionApplied`; inhibitor aggregation gates on `Refresh()`'s own `changed`).
+    [Fact]
+    public void OnSessionSwitch_returns_true_for_a_genuine_lock_to_unlock_or_unlock_to_lock_transition()
+    {
+        var mirror = new SessionLockMirror(initialLocked: false);
+
+        Assert.True(mirror.OnSessionSwitch(locked: true));
+        Assert.True(mirror.Locked);
+
+        Assert.True(mirror.OnSessionSwitch(locked: false));
+        Assert.False(mirror.Locked);
+    }
+
+    [Fact]
+    public void OnSessionSwitch_returns_false_for_a_duplicate_delivery_that_does_not_change_Locked()
+    {
+        var mirror = new SessionLockMirror(initialLocked: true);
+
+        // A duplicate SessionLock delivery: the mirror is already locked, so this is a genuine
+        // no-op -- the caller must not call Advance for it.
+        bool changed = mirror.OnSessionSwitch(locked: true);
+
+        Assert.False(changed);
+        Assert.True(mirror.Locked); // unchanged, and correctly still locked
+    }
+
+    [Fact]
+    public void OnSessionSwitch_returning_false_still_leaves_Locked_at_the_delivered_value()
+    {
+        // Even on the no-op path, Locked must reflect the delivered value exactly (it already
+        // did, which is precisely why changed is false) -- this pins that the no-op short
+        // circuit lives entirely in the caller's Advance-gating decision, never in whether
+        // Locked itself gets set.
+        var mirror = new SessionLockMirror(initialLocked: false);
+
+        bool changed = mirror.OnSessionSwitch(locked: false);
+
+        Assert.False(changed);
+        Assert.False(mirror.Locked);
+    }
+}
+
+/// SEC-4: a persisted `Paused:true` restart-stamps flag is deliberately inherited across a
+/// self-restart (RFC 0002-environment-levels, "Pause ownership") -- but the stamps file is
+/// same-user readable/writable, so a forged or corrupted flag would otherwise start the app
+/// paused with no cue beyond the tray text. This pins the pure trigger: exactly one non-null
+/// WARNING message when startup inherited a pause, and no message (and therefore no log line)
+/// otherwise -- mirroring SuppressionTransitionVerdict.TransitionLogMessage's established
+/// null-means-no-log contract in this same file.
+public class StartupPauseInheritedWarningTests
+{
+    [Fact]
+    public void Inherited_pause_produces_a_single_loud_warning_message()
+    {
+        var message = PolicyBridge.StartupPauseInheritedWarning(startupPaused: true);
+
+        Assert.NotNull(message);
+        Assert.StartsWith("WARNING:", message);
+        Assert.Contains("PAUSED", message);
+    }
+
+    [Fact]
+    public void No_inherited_pause_produces_no_warning_message()
+    {
+        Assert.Null(PolicyBridge.StartupPauseInheritedWarning(startupPaused: false));
     }
 }
 

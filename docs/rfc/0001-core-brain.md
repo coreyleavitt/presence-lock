@@ -1,7 +1,12 @@
 # RFC: PresenceLock.Core — full-brain policy extraction to F#
 
-Status: Implemented (all code slices shipped through 1.0.8.4; stage-4 code review pending, to run
-over this scope together with 0002-environment-levels.md once that RFC's slices land)
+Status: Implemented; shared decision-core/shell reviewed in 0002-environment-levels.md's
+stage-4 pass (2 rounds, 2026-09-01) — its still-authoritative contracts (decision-state,
+signal-health, recovery, restart stamps, PresenceFilter/FrameFreshness) were read in full by
+the correctness/security/design lenses and came back clean (only Lows: CORE-1 FrameFreshness
+`.Value` → total match, fixed; CORE-2 restart-streak prose loosely worded, doc follow-up). The
+superseded session/pause event contract was not re-reviewed (0002 replaced it). (all code
+slices shipped through 1.0.8.4)
 
 ## Motivation
 
@@ -293,10 +298,16 @@ Notes:
 - **Recovery boundary — `InitFailed` vs `CaptureFailed`:** these are deliberately separate
   events, not one `handleInvalid` flag with shell-side pre-triage, because they have different
   restart policies:
-  - `InitFailed` (never yet succeeded this process): streak-gated. Only after
-    `RecoveryFailureThreshold` **consecutive** handle-invalid `InitFailed` events, and
-    `RecoveryCooldownMs` elapsed since `RestartStamps.WedgeAt` (wall-clock), does `step` emit
-    `Action.Restart CameraWedged`. Below threshold, retrying in-process is empirically safe —
+  - `InitFailed` (never yet succeeded this process): streak-gated. `InitFailStreak`
+    increments on **every** consecutive `InitFailed` regardless of classification
+    (`InitFailStreak + 1` per event); the restart fires only when that streak has reached
+    `RecoveryFailureThreshold` **and** the *triggering* `InitFailed` is handle-invalid
+    (`wantsRestart = handleInvalid && streak >= RecoveryFailureThreshold`), with
+    `RecoveryCooldownMs` elapsed since `RestartStamps.WedgeAt` (wall-clock), before `step`
+    emits `Action.Restart CameraWedged`. Note the precise reading: it is the current event's
+    handle-invalid flag that is required, not that all failures composing the streak were
+    handle-invalid — a non-handle-invalid failure still advances the streak, it just can't
+    itself trigger the restart. Below threshold, retrying in-process is empirically safe —
     this is the "startup retry" path.
   - `CaptureFailed` (a previously-live capture just died): **not** streak-gated and **not**
     classification-gated. Once `InitSucceeded` has occurred this process, *any* `CaptureFailed`

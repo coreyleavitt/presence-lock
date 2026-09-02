@@ -9,6 +9,9 @@ TestResults/
 # SDK build tools (restored by pack.ps1 from NuGet)
 tools/
 
+# NuGet package caches leaked by container test runs
+nuget/
+
 # Signing material — private key and password must never be committed
 cert/
 

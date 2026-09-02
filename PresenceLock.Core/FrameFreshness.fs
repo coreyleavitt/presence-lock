@@ -72,7 +72,15 @@ module FrameFreshness =
             let (MonotonicMs nowMs) = now
             // `LastAdvanceAt` is always `Some` here: `advanced` is false only when
             // `state.LastTimestamp` was already `Some`, which -- by the invariant on
-            // `FreshnessState` -- means `state.LastAdvanceAt` is `Some` too.
-            let (MonotonicMs lastAdvanceMs) = state.LastAdvanceAt.Value
+            // `FreshnessState` -- means `state.LastAdvanceAt` is `Some` too. Matched totally
+            // (not `.Value`), mirroring `PresenceFilter.step`'s treatment of its own paired
+            // `(PreviousBox, RunStartAt)` option fields: the `None` arm is structurally
+            // unreachable given the invariant and falls back to `now` -- the same safe
+            // fallback `PresenceFilter` uses -- rather than risking an NRE if a future
+            // refactor ever breaks the pairing.
+            let lastAdvanceMs =
+                match state.LastAdvanceAt with
+                | Some (MonotonicMs advanceMs) -> advanceMs
+                | None -> nowMs
             { State = state
               IsFresh = nowMs - lastAdvanceMs < config.StaleAfterMs }
