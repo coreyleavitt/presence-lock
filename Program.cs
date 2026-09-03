@@ -376,6 +376,12 @@ sealed class WatcherContext : ApplicationContext
     // Dedup for the tray/status render (0001-core-brain.md: "the shell ... re-renders only when
     // the rendered string differs").
     string? lastRenderedStatusText;
+    // Policy-config fallback flag (stage-4 follow-up: "Status annotation when config makes
+    // locking effectively unreachable"): true while BuildPolicyConfig has rejected the on-disk
+    // policy fields and the built-in defaults are live. Written at both BuildPolicyConfig call
+    // sites (startup load, Settings commit) and read only by Render's annotation, so a
+    // corrected config clears the annotation on commit without any extra wiring.
+    bool policyDefaultsInUse;
 
     // Sensing diagnostics: the log records decisions only, so a feed that keeps
     // "seeing" a face produces total silence while locks never fire. Logs
@@ -575,7 +581,7 @@ sealed class WatcherContext : ApplicationContext
     public WatcherContext()
     {
         cfg = Config.Load();
-        policyConfig = PolicyBridge.BuildPolicyConfig(cfg);
+        policyConfig = PolicyBridge.BuildPolicyConfig(cfg, out policyDefaultsInUse);
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
         ui = SynchronizationContext.Current!;
 
@@ -774,7 +780,7 @@ sealed class WatcherContext : ApplicationContext
         // state) would run unsuppressed with a wrong tray status for up to one watchdog
         // interval.
         var startup = AssembleStartupInputs(
-            PolicyBridge.ConsumePersistedPausedFlag, QuerySessionLocked, InputIdleMs);
+            () => PolicyBridge.ConsumePersistedPausedFlag(), QuerySessionLocked, InputIdleMs);
         paused = startup.Paused;
         sessionLockMirror = new SessionLockMirror(startup.SessionLocked);
         // SEC-4: an unexpected paused start must be diagnosable, not silent — see
@@ -1297,8 +1303,10 @@ sealed class WatcherContext : ApplicationContext
         // echo exists for the verification harness/diagnostics only). Advance calls step and
         // this render synchronously back-to-back, so the registry snapshot read here is exactly
         // as current as it will ever be for this tick.
-        string text = PolicyBridge.AppendInhibitionAnnotation(
-            PolicyBridge.StatusText(status, lastObservationDark), inhibitorRegistry.Active, inhibitorRegistry.ActiveNames);
+        string text = PolicyBridge.AppendConfigFallbackAnnotation(
+            PolicyBridge.AppendInhibitionAnnotation(
+                PolicyBridge.StatusText(status, lastObservationDark), inhibitorRegistry.Active, inhibitorRegistry.ActiveNames),
+            policyDefaultsInUse);
         if (text != lastRenderedStatusText)
         {
             lastRenderedStatusText = text;
@@ -1388,7 +1396,7 @@ sealed class WatcherContext : ApplicationContext
             // step, so a committed Settings change must be visible on the very next sample too,
             // via the same shared mapping function file-load uses (BuildPolicyConfig) — the
             // Settings commit path routes through it already; nothing else to wire here.
-            policyConfig = PolicyBridge.BuildPolicyConfig(cfg);
+            policyConfig = PolicyBridge.BuildPolicyConfig(cfg, out policyDefaultsInUse);
             sampleTimer.Interval = cfg.SampleIntervalMs;
             Log.Write($"config updated (threshold {cfg.AwayThresholdSeconds}s, " +
                       $"input idle {cfg.InputIdleSeconds}s, sample {cfg.SampleIntervalMs}ms, " +

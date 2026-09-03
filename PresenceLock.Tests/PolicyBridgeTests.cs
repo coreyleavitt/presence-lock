@@ -352,6 +352,24 @@ public class BuildPolicyConfigTests
         Assert.Equal(defaults.AwayThresholdMs, policy.AwayThresholdMs);
         Assert.Equal(defaults.RecoveryCooldownMs, policy.RecoveryCooldownMs);
     }
+
+    /// Stage-4 follow-up ("Status annotation when config makes locking effectively
+    /// unreachable"): the out-param is the annotation's one source of truth, so it must agree
+    /// exactly with the all-or-nothing fallback — true whenever DefaultPolicyConfig was
+    /// substituted, false whenever the on-disk values were accepted.
+    [Fact]
+    public void Out_of_range_policy_fields_report_defaults_in_use()
+    {
+        PolicyBridge.BuildPolicyConfig(new Config { AwayThresholdSeconds = 0.0 }, out bool defaultsInUse);
+        Assert.True(defaultsInUse);
+    }
+
+    [Fact]
+    public void In_range_policy_fields_report_defaults_not_in_use()
+    {
+        PolicyBridge.BuildPolicyConfig(new Config(), out bool defaultsInUse);
+        Assert.False(defaultsInUse);
+    }
 }
 
 /// Frozen-frame classification (bug fix): `TryAcquireLatestFrame` can re-serve a cached frame
@@ -867,12 +885,31 @@ public class SelectPreferredCameraTests
     }
 }
 
-public class LoadRestartStampsTests
+/// Hermetic base for every test class that exercises the stamps-file functions (stage-4
+/// follow-up: these previously read/wrote the real per-user %LOCALAPPDATA% file — "no seam to
+/// inject a path" — and flaked once in the Windows container with UnauthorizedAccessException).
+/// xunit constructs a fresh instance per test method, so each test gets its own temp state dir
+/// and runs parallel-safe with no cross-test file cleanup choreography; Dispose removes the dir.
+public abstract class StampsStateDirFixture : IDisposable
+{
+    private protected readonly string stateDir = Path.Combine(
+        Path.GetTempPath(), "PresenceLock.Tests", Guid.NewGuid().ToString("N"));
+
+    private protected string StampsPath => Path.Combine(stateDir, "restart-stamps.json");
+
+    public void Dispose()
+    {
+        try { Directory.Delete(stateDir, recursive: true); }
+        catch (DirectoryNotFoundException) { }
+    }
+}
+
+public class LoadRestartStampsTests : StampsStateDirFixture
 {
     [Fact]
     public void Missing_file_yields_empty_stamps()
     {
-        var stamps = PolicyBridge.LoadRestartStamps();
+        var stamps = PolicyBridge.LoadRestartStamps(stateDir);
         // This call must never throw and must default to empty when the file is absent.
         Assert.False(stamps.WedgeAt.HasValue);
         Assert.False(stamps.ReevalAt.HasValue);
@@ -881,57 +918,35 @@ public class LoadRestartStampsTests
 }
 
 /// Stamps-file writer round-trip (0001-core-brain.md, "Restart stamps" / R1-29) and the
-/// paused-flag consume-and-clear file semantics (R2-11's pinned lifecycle). These tests read
-/// and write the real per-user stamps file (there is no seam to inject a path), matching
-/// LoadRestartStampsTests' existing precedent — each test restores the file to "absent" in a
-/// finally block so it does not leak state into other tests in this collection.
-public class RestartStampsPersistenceTests
+/// paused-flag consume-and-clear file semantics (R2-11's pinned lifecycle), each against its
+/// own temp state dir per StampsStateDirFixture.
+public class RestartStampsPersistenceTests : StampsStateDirFixture
 {
-    static readonly string StampsPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PresenceLock", "restart-stamps.json");
-
     [Fact]
     public void Saved_stamps_round_trip_through_LoadRestartStamps()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        try
-        {
-            var stamps = new Core.RestartStamps(
-                wedgeAt: 1_700_000_000_000, reevalAt: 1_700_000_500_000, upgradeAt: 1_700_000_800_000);
+        var stamps = new Core.RestartStamps(
+            wedgeAt: 1_700_000_000_000, reevalAt: 1_700_000_500_000, upgradeAt: 1_700_000_800_000);
 
-            PolicyBridge.SaveRestartStamps(stamps, paused: false);
-            var loaded = PolicyBridge.LoadRestartStamps();
+        PolicyBridge.SaveRestartStamps(stamps, paused: false, stateDir);
+        var loaded = PolicyBridge.LoadRestartStamps(stateDir);
 
-            Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
-            Assert.Equal(1_700_000_500_000, loaded.ReevalAt);
-            Assert.Equal(1_700_000_800_000, loaded.UpgradeAt);
-        }
-        finally
-        {
-            if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        }
+        Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
+        Assert.Equal(1_700_000_500_000, loaded.ReevalAt);
+        Assert.Equal(1_700_000_800_000, loaded.UpgradeAt);
     }
 
     [Fact]
     public void Saved_stamps_with_only_one_reason_set_round_trip_the_others_as_absent()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        try
-        {
-            var stamps = new Core.RestartStamps(wedgeAt: 1_700_000_000_000, reevalAt: null, upgradeAt: null);
+        var stamps = new Core.RestartStamps(wedgeAt: 1_700_000_000_000, reevalAt: null, upgradeAt: null);
 
-            PolicyBridge.SaveRestartStamps(stamps, paused: false);
-            var loaded = PolicyBridge.LoadRestartStamps();
+        PolicyBridge.SaveRestartStamps(stamps, paused: false, stateDir);
+        var loaded = PolicyBridge.LoadRestartStamps(stateDir);
 
-            Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
-            Assert.False(loaded.ReevalAt.HasValue);
-            Assert.False(loaded.UpgradeAt.HasValue);
-        }
-        finally
-        {
-            if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        }
+        Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
+        Assert.False(loaded.ReevalAt.HasValue);
+        Assert.False(loaded.UpgradeAt.HasValue);
     }
 
     /// Back-compat (0001-core-brain.md addendum 2026-08-01, slice 10): a stamps file written by
@@ -941,70 +956,45 @@ public class RestartStampsPersistenceTests
     [Fact]
     public void An_old_two_field_stamps_file_loads_with_a_null_UpgradeAt()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(StampsPath)!);
-            File.WriteAllText(StampsPath, """{"WedgeAt":1700000000000,"ReevalAt":null,"Paused":false}""");
+        Directory.CreateDirectory(Path.GetDirectoryName(StampsPath)!);
+        File.WriteAllText(StampsPath, """{"WedgeAt":1700000000000,"ReevalAt":null,"Paused":false}""");
 
-            var loaded = PolicyBridge.LoadRestartStamps();
+        var loaded = PolicyBridge.LoadRestartStamps(stateDir);
 
-            Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
-            Assert.False(loaded.ReevalAt.HasValue);
-            Assert.False(loaded.UpgradeAt.HasValue);
-        }
-        finally
-        {
-            if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        }
+        Assert.Equal(1_700_000_000_000, loaded.WedgeAt);
+        Assert.False(loaded.ReevalAt.HasValue);
+        Assert.False(loaded.UpgradeAt.HasValue);
     }
 
     [Fact]
     public void Consume_returns_false_and_writes_nothing_when_no_file_exists()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        Assert.False(PolicyBridge.ConsumePersistedPausedFlag());
+        Assert.False(PolicyBridge.ConsumePersistedPausedFlag(stateDir));
         Assert.False(File.Exists(StampsPath));
     }
 
     [Fact]
     public void Consume_returns_false_when_the_persisted_flag_is_not_set()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        try
-        {
-            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false);
-            Assert.False(PolicyBridge.ConsumePersistedPausedFlag());
-        }
-        finally
-        {
-            if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        }
+        PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false, stateDir);
+        Assert.False(PolicyBridge.ConsumePersistedPausedFlag(stateDir));
     }
 
     [Fact]
     public void Consume_returns_true_once_and_clears_the_flag_while_preserving_stamps()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        try
-        {
-            var stamps = new Core.RestartStamps(wedgeAt: 42, reevalAt: 43, upgradeAt: 44);
-            PolicyBridge.SaveRestartStamps(stamps, paused: true);
+        var stamps = new Core.RestartStamps(wedgeAt: 42, reevalAt: 43, upgradeAt: 44);
+        PolicyBridge.SaveRestartStamps(stamps, paused: true, stateDir);
 
-            Assert.True(PolicyBridge.ConsumePersistedPausedFlag());
-            // Consumed-and-cleared: a second call sees the flag already cleared.
-            Assert.False(PolicyBridge.ConsumePersistedPausedFlag());
+        Assert.True(PolicyBridge.ConsumePersistedPausedFlag(stateDir));
+        // Consumed-and-cleared: a second call sees the flag already cleared.
+        Assert.False(PolicyBridge.ConsumePersistedPausedFlag(stateDir));
 
-            // Stamps themselves survive the clear untouched.
-            var loaded = PolicyBridge.LoadRestartStamps();
-            Assert.Equal(42L, loaded.WedgeAt);
-            Assert.Equal(43L, loaded.ReevalAt);
-            Assert.Equal(44L, loaded.UpgradeAt);
-        }
-        finally
-        {
-            if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        }
+        // Stamps themselves survive the clear untouched.
+        var loaded = PolicyBridge.LoadRestartStamps(stateDir);
+        Assert.Equal(42L, loaded.WedgeAt);
+        Assert.Equal(43L, loaded.ReevalAt);
+        Assert.Equal(44L, loaded.UpgradeAt);
     }
 }
 
@@ -1583,55 +1573,31 @@ public class StatusTextExhaustivenessTests
 
 /// Migration cleanup (0001-core-brain.md, "Restart stamps" / R2-34): the superseded
 /// last-restart.txt is deleted the first time SaveRestartStamps runs on an upgraded build.
-/// Same real-filesystem precedent as RestartStampsPersistenceTests — no seam to inject a path.
-public class LegacyRestartStampCleanupTests
+/// Hermetic per StampsStateDirFixture, like every other stamps-file test.
+public class LegacyRestartStampCleanupTests : StampsStateDirFixture
 {
-    static readonly string StampsPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PresenceLock", "restart-stamps.json");
-
-    static readonly string LegacyPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PresenceLock", "last-restart.txt");
+    string LegacyPath => Path.Combine(stateDir, "last-restart.txt");
 
     [Fact]
     public void SaveRestartStamps_deletes_a_pre_existing_legacy_stamp_file()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        Directory.CreateDirectory(Path.GetDirectoryName(LegacyPath)!);
+        Directory.CreateDirectory(stateDir);
         File.WriteAllText(LegacyPath, DateTime.UtcNow.ToString("o"));
-        try
-        {
-            Assert.True(File.Exists(LegacyPath));
+        Assert.True(File.Exists(LegacyPath));
 
-            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false);
+        PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false, stateDir);
 
-            Assert.False(File.Exists(LegacyPath));
-        }
-        finally
-        {
-            if (File.Exists(StampsPath)) File.Delete(StampsPath);
-            if (File.Exists(LegacyPath)) File.Delete(LegacyPath);
-        }
+        Assert.False(File.Exists(LegacyPath));
     }
 
     [Fact]
     public void SaveRestartStamps_is_silent_when_no_legacy_stamp_file_exists()
     {
-        if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        if (File.Exists(LegacyPath)) File.Delete(LegacyPath);
-        try
-        {
-            // Absence is the steady state after the first upgraded run — must never throw and
-            // must not conjure the legacy file back into existence.
-            PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false);
+        // Absence is the steady state after the first upgraded run — must never throw and
+        // must not conjure the legacy file back into existence.
+        PolicyBridge.SaveRestartStamps(new Core.RestartStamps(wedgeAt: null, reevalAt: null, upgradeAt: null), paused: false, stateDir);
 
-            Assert.False(File.Exists(LegacyPath));
-        }
-        finally
-        {
-            if (File.Exists(StampsPath)) File.Delete(StampsPath);
-        }
+        Assert.False(File.Exists(LegacyPath));
     }
 }
 
@@ -1885,6 +1851,59 @@ public class AppendInhibitionAnnotationTests
 
             // Inactive must never annotate, for every row alike.
             Assert.Equal(baseText, PolicyBridge.AppendInhibitionAnnotation(baseText, inhibited: false, activeNames: []));
+        }
+    }
+}
+
+/// Stage-4 follow-up ("Status annotation when config makes locking effectively unreachable"):
+/// same orthogonal-annotation design as AppendInhibitionAnnotationTests — the cue composes
+/// with every Status row and with the inhibition annotation, never hides behind either.
+public class AppendConfigFallbackAnnotationTests
+{
+    [Fact]
+    public void An_accepted_config_leaves_the_status_text_unchanged()
+    {
+        Assert.Equal("Watching", PolicyBridge.AppendConfigFallbackAnnotation("Watching", policyDefaultsInUse: false));
+    }
+
+    [Fact]
+    public void A_rejected_config_appends_the_defaults_in_use_cue()
+    {
+        Assert.Equal(
+            "Watching · config out of range — defaults in use",
+            PolicyBridge.AppendConfigFallbackAnnotation("Watching", policyDefaultsInUse: true));
+    }
+
+    [Fact]
+    public void The_annotation_composes_after_the_inhibition_annotation_matching_Renders_order()
+    {
+        // Render's pinned composition order: status row, then inhibition (tick-fresh state),
+        // then config fallback (load-time state). Both cues must be visible simultaneously.
+        string text = PolicyBridge.AppendConfigFallbackAnnotation(
+            PolicyBridge.AppendInhibitionAnnotation("Watching", inhibited: true, activeNames: ["media-playing"]),
+            policyDefaultsInUse: true);
+
+        Assert.Equal("Watching · lock inhibited (media-playing) · config out of range — defaults in use", text);
+    }
+
+    [Fact]
+    public void The_annotation_composes_with_every_Status_row()
+    {
+        var allStatusValues = typeof(Core.Status)
+            .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(p => p.PropertyType == typeof(Core.Status))
+            .Select(p => (Core.Status)p.GetValue(null)!)
+            .ToList();
+
+        Assert.NotEmpty(allStatusValues);
+        foreach (var status in allStatusValues)
+        {
+            string baseText = PolicyBridge.StatusText(status, lastObservationDark: false);
+            string annotated = PolicyBridge.AppendConfigFallbackAnnotation(baseText, policyDefaultsInUse: true);
+
+            Assert.StartsWith(baseText, annotated);
+            Assert.EndsWith(" · config out of range — defaults in use", annotated);
+            Assert.Equal(baseText, PolicyBridge.AppendConfigFallbackAnnotation(baseText, policyDefaultsInUse: false));
         }
     }
 }

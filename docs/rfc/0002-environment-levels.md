@@ -865,20 +865,23 @@ cadence — accepted, and now the *only* accepted cost here.
 The stage-4 review reached the floor (0 Critical/High/Medium; see the handoff ledger for
 the full per-finding record). These remain as real, deferred work:
 
-- **Defeat-resistance for the SEC-1/SEC-4/SEC-2 same-user residuals → re-homed to
-  0003-defeat-resistance-layering.md** (2026-09-01). The short version: an app-level
-  self-protection service is the *wrong* answer (same-user code is already inside the boundary
-  the screen lock defends), so real defeat-resistance belongs in an OS-enforced inactivity
-  lock, and the only legitimate app-side remnant is a restart-only *reliability* watchdog that
-  keeps failures visible. Full rationale, layering, and open questions live in RFC-0003.
-- **Status annotation when config makes locking effectively unreachable.** The SEC-3 fix
-  added upper-bound ceilings so an absurd `AwayThresholdSeconds` is rejected outright; a
-  belt-and-suspenders annotation (surfacing "config out of range → defaults in use", the way
-  the SMTC path annotates inhibition) was deferred.
-- **SMTC false-positive hardening** (already an accepted known-limitation): muted/background
-  autoplay, and a same-user process registering a phantom `Playing` session, both inhibit the
-  lock. Kill switch + always-visible annotation are the v1 mitigations; a volume/attention-aware
-  refinement (WASAPI) remains future work.
+- **Defeat-resistance for the SEC-1/SEC-4/SEC-2 same-user residuals** — ✅ resolved for this
+  RFC by transfer 2026-09-01: 0003-defeat-resistance-layering.md owns this work. The short
+  version: an app-level self-protection service is the *wrong* answer (same-user code is
+  already inside the boundary the screen lock defends), so real defeat-resistance belongs in
+  an OS-enforced inactivity lock, and the only legitimate app-side remnant is a restart-only
+  *reliability* watchdog that keeps failures visible. Full rationale, layering, and open
+  questions live in RFC-0003.
+- **Status annotation when config makes locking effectively unreachable** — ✅ landed
+  2026-09-03: `BuildPolicyConfig` gained an `out defaultsInUse` overload (both product call
+  sites recompute it, so a corrected Settings commit clears the cue live) and
+  `AppendConfigFallbackAnnotation` composes " · config out of range — defaults in use" after
+  the inhibition annotation, orthogonally to every Status row; order and per-row composition
+  pinned by tests.
+- **SMTC false-positive hardening** — ✅ resolved for this RFC by transfer 2026-09-03:
+  0004-smtc-false-positive-hardening.md (Seed) owns the volume/attention-aware refinement.
+  Within 0002 it stays an accepted known-limitation with the kill switch + always-visible
+  annotation as the v1 mitigations.
 - **Doc/polish batch** (deferred Lows) — ✅ landed 2026-09-01 (2nd fix pass, suite green
   core 92/92 + shell 149/149): `starvationMs` extracted to
   `PolicyBridge.SamplingStarvationThresholdMs` + tests (DES-4); `NowMonotonic()` helper
@@ -892,6 +895,7 @@ the full per-finding record). These remain as real, deferred work:
   `Advance(Reconcile)` gated on `changed` and adversarially verified sound (SHELL-1).
   Remaining, deliberately kept: DES-2b (one throwaway alloc/startup — removing it forces a
   CS8602 on the watchdog closure's flow-state; not worth it).
-- **Non-hermetic test** (observed, pre-existing): `RestartStampsPersistenceTests` writes/deletes
-  a real file under `%LOCALAPPDATA%`, which flaked once in the Windows container with
-  `UnauthorizedAccessException`; it should be sandboxed to a temp dir.
+- **Non-hermetic test** (observed, pre-existing) — ✅ fixed 2026-09-03: the three stamps
+  functions gained an optional `stateDir` test seam (product call sites unchanged), and every
+  stamps-file test class now derives from `StampsStateDirFixture` — a fresh per-test temp dir,
+  deleted on Dispose — instead of writing the real `%LOCALAPPDATA%` file.

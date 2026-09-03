@@ -39,7 +39,14 @@ static class PolicyBridge
     /// away-threshold floor below, the one place a sensing field and a policy field interact.
     /// Shared by file load and (once the Settings dialog wires it) the commit path, per the
     /// RFC — same function, so an invalid committed value can never reach `step` unvalidated.
-    internal static Core.PolicyConfig BuildPolicyConfig(Config cfg)
+    /// The `out defaultsInUse` overload additionally reports whether the all-or-nothing
+    /// fallback fired, feeding `Render`'s config-fallback annotation (stage-4 follow-up:
+    /// "Status annotation when config makes locking effectively unreachable") — the load-time
+    /// log line below stays the detailed diagnostic; the annotation is the always-visible cue.
+    internal static Core.PolicyConfig BuildPolicyConfig(Config cfg) =>
+        BuildPolicyConfig(cfg, out _);
+
+    internal static Core.PolicyConfig BuildPolicyConfig(Config cfg, out bool defaultsInUse)
     {
         long awayMs = (long)(cfg.AwayThresholdSeconds * 1000);
         long idleMs = (long)(cfg.InputIdleSeconds * 1000);
@@ -91,6 +98,7 @@ static class PolicyBridge
             // relaxed, noSignalMs would still carry its own bound rather than silently losing it.
             reevaluateAfterMs >= noSignalMs && awayMs >= awayFloorMs;
 
+        defaultsInUse = !valid;
         if (!valid)
         {
             Log.Write("policy config values out of range — falling back to built-in defaults for all policy fields");
@@ -435,6 +443,18 @@ static class PolicyBridge
     internal static string AppendInhibitionAnnotation(string statusText, bool inhibited, IReadOnlyList<string> activeNames) =>
         inhibited ? $"{statusText} · lock inhibited ({string.Join(", ", activeNames)})" : statusText;
 
+    /// Shell-side config-fallback annotation (stage-4 follow-up: "Status annotation when config
+    /// makes locking effectively unreachable"): appended whenever `BuildPolicyConfig` rejected
+    /// the on-disk policy fields and the built-in defaults are live, regardless of which
+    /// `Status` row is showing. The SEC-3 ceilings already make the *behavior* safe (defaults,
+    /// never the absurd value); this makes the substitution visible somewhere better than one
+    /// log line at load time, exactly the way the SMTC path annotates inhibition. Composes
+    /// AFTER `AppendInhibitionAnnotation` (order pinned by test): same orthogonal-to-the-row
+    /// design, and a corrected config clears it on the next Settings commit because both
+    /// `BuildPolicyConfig` call sites recompute the flag.
+    internal static string AppendConfigFallbackAnnotation(string statusText, bool policyDefaultsInUse) =>
+        policyDefaultsInUse ? $"{statusText} · config out of range — defaults in use" : statusText;
+
     /// Shared event-construction function (0001-core-brain.md slice 8a: "Factor each call
     /// site's event construction into a small named function... reused unchanged by 8a's
     /// `ShadowAdvance` and 8b's `Advance`"). The shell already computes `haveFrame`/`dark`/
@@ -537,28 +557,36 @@ static class PolicyBridge
 
     static readonly Core.RestartStamps EmptyRestartStamps = new(wedgeAt: null, reevalAt: null, upgradeAt: null);
 
-    static readonly string StampsPath = Path.Combine(
+    /// The stamps files' home when no override is supplied — the app's real per-user state
+    /// dir. The `stateDir` parameters on the three stamps functions below are a test seam
+    /// (stage-4 follow-up: `RestartStampsPersistenceTests` wrote the real %LOCALAPPDATA% file
+    /// and flaked in the Windows container): tests point them at a per-test temp dir; product
+    /// call sites always pass nothing.
+    static readonly string DefaultStateDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PresenceLock", "restart-stamps.json");
+        "PresenceLock");
 
-    /// The file this JSON stamps file supersedes (0001-core-brain.md, "Restart stamps" / R2-34):
-    /// a plain-text single wall-clock timestamp, replaced by `StampsPath`'s per-`RestartReason`
-    /// JSON. Deleted the first time `SaveRestartStamps` runs on an upgraded build — see there.
-    static readonly string LegacyRestartStampPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PresenceLock", "last-restart.txt");
+    static string StampsPathIn(string? stateDir) =>
+        Path.Combine(stateDir ?? DefaultStateDir, "restart-stamps.json");
+
+    /// The file the JSON stamps file supersedes (0001-core-brain.md, "Restart stamps" / R2-34):
+    /// a plain-text single wall-clock timestamp, replaced by the per-`RestartReason` JSON.
+    /// Deleted the first time `SaveRestartStamps` runs on an upgraded build — see there.
+    static string LegacyRestartStampPathIn(string? stateDir) =>
+        Path.Combine(stateDir ?? DefaultStateDir, "last-restart.txt");
 
     /// Reads the wall-clock stamps file (0001-core-brain.md, "Restart stamps") if present, else
     /// returns empty stamps — any read/parse error also yields empty, since a parse failure
     /// must never block recovery. Feeds `Policy.start` at every startup; the counterpart writer
     /// is `SaveRestartStamps`, called only from `RestartProcess()` immediately before spawn.
-    internal static Core.RestartStamps LoadRestartStamps()
+    internal static Core.RestartStamps LoadRestartStamps(string? stateDir = null)
     {
+        var stampsPath = StampsPathIn(stateDir);
         try
         {
-            if (File.Exists(StampsPath))
+            if (File.Exists(stampsPath))
             {
-                var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(StampsPath));
+                var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(stampsPath));
                 if (dto is not null)
                     return new Core.RestartStamps(wedgeAt: dto.WedgeAt, reevalAt: dto.ReevalAt, upgradeAt: dto.UpgradeAt);
             }
@@ -577,11 +605,12 @@ static class PolicyBridge
     /// immediately before spawn — never on any other path (R2-11's pinned lifecycle: the flag
     /// is written only here and consumed-and-cleared by `ConsumePersistedPausedFlag`). A write
     /// failure must not block the restart itself, so it is caught and logged, not thrown.
-    internal static void SaveRestartStamps(Core.RestartStamps stamps, bool paused)
+    internal static void SaveRestartStamps(Core.RestartStamps stamps, bool paused, string? stateDir = null)
     {
+        var stampsPath = StampsPathIn(stateDir);
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(StampsPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(stampsPath)!);
             var dto = new RestartStampsDto
             {
                 WedgeAt = stamps.WedgeAt,
@@ -589,7 +618,7 @@ static class PolicyBridge
                 UpgradeAt = stamps.UpgradeAt,
                 Paused = paused,
             };
-            File.WriteAllText(StampsPath, JsonSerializer.Serialize(dto, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(stampsPath, JsonSerializer.Serialize(dto, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch (Exception ex)
         {
@@ -604,7 +633,7 @@ static class PolicyBridge
         // support, so it is caught and logged, not thrown.
         try
         {
-            File.Delete(LegacyRestartStampPath);
+            File.Delete(LegacyRestartStampPathIn(stateDir));
         }
         catch (Exception ex)
         {
@@ -620,12 +649,13 @@ static class PolicyBridge
     /// false — and touches nothing on disk — when absent/false/unparseable, so a normal launch
     /// or a tray Exit never inherits a stale pause, and a parse failure never blocks startup.
     /// Called exactly once, from `WatcherContext`'s constructor.
-    internal static bool ConsumePersistedPausedFlag()
+    internal static bool ConsumePersistedPausedFlag(string? stateDir = null)
     {
+        var stampsPath = StampsPathIn(stateDir);
         try
         {
-            if (!File.Exists(StampsPath)) return false;
-            var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(StampsPath));
+            if (!File.Exists(stampsPath)) return false;
+            var dto = JsonSerializer.Deserialize<RestartStampsDto>(File.ReadAllText(stampsPath));
             if (dto is null || !dto.Paused) return false;
 
             var cleared = new RestartStampsDto
@@ -635,7 +665,7 @@ static class PolicyBridge
                 UpgradeAt = dto.UpgradeAt,
                 Paused = false,
             };
-            File.WriteAllText(StampsPath, JsonSerializer.Serialize(cleared, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(stampsPath, JsonSerializer.Serialize(cleared, new JsonSerializerOptions { WriteIndented = true }));
             return true;
         }
         catch (Exception ex)
@@ -647,7 +677,7 @@ static class PolicyBridge
 
     /// SEC-4 (reframed): the persisted pause flag survives a deliberate self-restart by design
     /// (RFC 0002-environment-levels, "Pause ownership") -- but the stamps file backing it
-    /// (`StampsPath`) is an ordinary same-user readable/writable file, so a forged or corrupted
+    /// (under `DefaultStateDir`) is an ordinary same-user readable/writable file, so a forged or corrupted
     /// `Paused:true` entry would otherwise start the app paused with only the tray text as a
     /// cue. Same-user tampering can't be prevented (this app's own threat model -- see
     /// CLAUDE.md), so an inherited-pause startup gets exactly one loud WARNING line instead of
